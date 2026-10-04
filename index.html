@@ -1474,11 +1474,27 @@ function rollGame() {
   if (recallNext) { g.presSeed = recallNext.presSeed; g.recall = recallNext; recallNext = null; }
   g.total = g.baseWin + g.bonusWin; return g;
 }
+// The whole game result is decided here, before the first wisp launches: every wisp's slot, the trigger, every bonus pack
+// (wisp slots, Multiball chain length, wheel rides + jackpot level, coins, Full Crypt). Planning/steering only animates it.
+const CHECK = { wisps: 0, mismatch: 0, rides: 0, rideMismatch: 0, chains: 0, chainMismatch: 0, list: [] };
+function decidedSnapshot(g) {
+  const d = { base: g.base.slots.slice(), trig: g.base.trig ? g.base.trig.slice() : null, baseWin: g.baseWin, bonusWin: g.bonusWin, total: g.total, packs: null };
+  if (g.bonus) d.packs = g.bonus.packs.map(pk => ({ slots: pk.wisps.map(w => w.slot), gates: pk.wisps.map(w => w.gate || null), B: pk.B, full: pk.fullWisp ? { slot: pk.fullWisp.slot, gate: pk.fullWisp.gate } : null }));
+  return JSON.parse(JSON.stringify(d));
+}
+function expectedSlot(f) { const d = game && game.decided; if (!d) return null; const c = pack.ctx;
+  if (c.kind === 'base') return d.base[f.entry];
+  if (c.golden) { const pk = d.packs && d.packs.find(q => q.full); return pk ? pk.full.slot : null; }
+  const pk = d.packs && d.packs[c.k]; return pk ? pk.slots[f.entry] : null; }
+function checkLanding(f, x) {
+  if (f.method === 'pure' || (game && game.pure)) return; const exp = expectedSlot(f); if (exp === null || exp === undefined) return;
+  const vis = P.slotOf(x); CHECK.wisps++; if (vis !== exp) { CHECK.mismatch++; if (CHECK.list.length < 50) CHECK.list.push({ game: stats.games, pack: pack.ctx.kind + (pack.ctx.k !== undefined ? pack.ctx.k : ''), entry: f.entry, kind: f.kind, exp, vis, x }); }
+}
 function startGame() {
   audioInit(); if (AU.ctx && AU.ctx.state === 'suspended') AU.ctx.resume();
   if (bal < BET) { bal += 1000; toast('FREE CREDITS +1,000'); }
   bal -= BET; lastWin = 0; topbar();
-  game = rollGame(); stats.games++;
+  game = rollGame(); stats.games++; game.decided = decidedSnapshot(game);
   const pure = game.recall ? !!game.recall.pure : (PARAM.blind && presRng() < 0.5); game.pure = pure;
   if (pure) { game.base.trig = null; game.bonus = null; game.bonusWin = 0; }
   store.set('pending', pure ? 0 : game.total); save();
@@ -1505,12 +1521,23 @@ function startPack(p, spec, ctx2) {
     wheel.ride = { f: gf, tc, te, lv, cabin: best, revealed: false };
   }
   pack.queue = launchQueue(p);
+  if (ctx2.kind === 'bonus' && game && game.decided && game.decided.packs && !game.pure) { const d = game.decided.packs; const pk = ctx2.golden ? d.find(q => q.full) : d[ctx2.k];
+    if (pk) { const expG = ctx2.golden ? pk.full.gate : pk.gates.find(Boolean) || null; const gotG = gf ? gf.ride.level : null; if (expG || gotG) { CHECK.rides++; if (expG !== gotG) { CHECK.rideMismatch++; CHECK.list.push({ ride: true, exp: expG, got: gotG }); } }
+      if (!ctx2.golden) { const nb = p.flights.filter(f => f.kind === 'break').length; CHECK.chains++; if (nb !== pk.B) { CHECK.chainMismatch++; CHECK.list.push({ chain: true, exp: pk.B, got: nb }); } } } }
+  if (PARAM.debug) decidedPanel(ctx2);
 }
+function decidedPanel(ctx2) { const d = game && game.decided; if (!d) return; let t;
+  if (game.pure) t = 'BLIND: pure physics pack (not pre-decided)';
+  else if (ctx2.kind === 'base') t = 'PRE-DECIDED at tap (before launch)\nbase slots: ' + d.base.join(' ') + '\ntrigger: ' + (d.trig ? d.trig.join('+') : '-') + '  base win ' + fmt(d.baseWin) + (d.packs ? '\nbonus: ' + d.packs.length + ' packs, win ' + fmt(d.bonusWin) : '') + '\ngame total ' + fmt(d.total);
+  else if (ctx2.golden) { const pk = d.packs.find(q => q.full); t = 'PRE-DECIDED Full Crypt ride: ' + pk.full.gate + ' -> slot ' + pk.full.slot; }
+  else { const pk = d.packs[ctx2.k]; t = 'PRE-DECIDED bonus pack ' + (ctx2.k + 1) + '/' + d.packs.length + '\nslots: ' + pk.slots.join(' ') + '\nchain breaks: ' + pk.B + '  wheel: ' + (pk.gates.find(Boolean) || '-') + '\ngame total ' + fmt(d.total); }
+  DEC_TXT = t + '\nlanding check: ' + CHECK.wisps + ' wisps, ' + CHECK.mismatch + ' mismatches'; }
+let DEC_TXT = '';
 function launchQueue(p) { return p.flights.filter(f => f.rail).map(f => f.rail.launch).sort((a, b) => a - b); }
 function wheelAngle(t) { let a = wheel.base + wheel.omega * t; for (const s of wheel.segs) { const u = Math.max(0, Math.min(1, (t - s.t0) / (s.t1 - s.t0))); a += s.d * (u * u * (3 - 2 * u)); } return a; }
 
 function skip() {
-  if (mode === 'base' || mode === 'bonus') { if (!pack) return; const tEnd = pack.p.tEnd + 0.01; advancePack(tEnd, true); pack.t = tEnd; FX_.flyers.forEach(fl => { fl.t = fl.dur; }); return; }
+  if (mode === 'base' || mode === 'bonus') { if (!pack) return; const tEnd = pack.p.tEnd + 0.01; if (pack.t >= tEnd) return; advancePack(tEnd, true); pack.t = tEnd; FX_.flyers.forEach(fl => { fl.t = fl.dur; }); return; }
   if (seq.length) { seq[0].skip = true; }
 }
 // ---- cheat: tap a neon sign to arm its bonus for the next game (2 signs = combo, 3 = Midnight); tap a plush to arm a wheel ride onto that jackpot ----
@@ -1549,6 +1576,7 @@ function flightEnd(f, quick) {
   if (f.kind === 'break') { const q = pack.p.pumps[f.pump]; burst(FX + q.x, FY + q.y, quick); if (!quick) sPop(); const v = C.BURST_V * WP; pack.sum += v; addFloat('+' + fmt(v), FX + q.x, FY + q.y - 10, '#ffb04a', 11, quick); return; }
   if (f.kind === 'gate') { if (!quick) { sWhoosh(); } return; }
   const slot = f.landed !== undefined ? f.landed : spec.wisps[f.entry].slot;
+  checkLanding(f, x);
   landing(slot, f.entry, quick, x);
 }
 function landing(slot, e, quick, x) {
@@ -1899,11 +1927,11 @@ function drawCeleb(c, time) {
 function debugPanel() {
   const el = document.getElementById('dbg'); if (PARAM.blind) { el.style.display = 'none'; return; } el.style.display = 'block';
   const m = stats.methods, tot = m.main + m.fallback + m.corrector || 1;
-  el.textContent = `games ${stats.games} packs ${stats.packs} wisps ${stats.wisps}\nmain ${m.main} fallback ${m.fallback} corrector ${m.corrector}\nlast plan ${stats.lastPlanMs.toFixed(1)} ms ${worker ? '(worker)' : '(main thread)'}\navg candidates/wisp ${(stats.cand / Math.max(1, stats.wisps)).toFixed(1)}\nlabels: target slot, f=fallback c=corrector, V=gate, P=pumpkin`;
+  el.textContent = `games ${stats.games} packs ${stats.packs} wisps ${stats.wisps}\nmain ${m.main} fallback ${m.fallback} corrector ${m.corrector}\nlast plan ${stats.lastPlanMs.toFixed(1)} ms ${worker ? '(worker)' : '(main thread)'}\navg candidates/wisp ${(stats.cand / Math.max(1, stats.wisps)).toFixed(1)}\nlabels: target slot, f=fallback c=corrector, V=gate, P=pumpkin\n----\n${DEC_TXT}`;
 }
 
 // ---------- test hooks ----------
-window.__QL = () => QL; window.__A = A; window.__SPR = SPR; window.__mf = { get mode() { return mode; }, get bal() { return bal; }, get lastWin() { return lastWin; }, get game() { return game; }, get stats() { return stats; }, get pack() { return pack; }, get bonus() { return bonusRun; }, get fx() { return FX_; }, get armed() { return { signs: [...armed.signs], jp: armed.jp }; }, get wheel() { return wheel; }, get seqName() { return seq.length ? (seq[0].name || seq[0].dur) : null; }, tap() { if (mode === 'idle') startGame(); else skip(); } };
+window.__QL = () => QL; window.__A = A; window.__SPR = SPR; window.__mf = { get mode() { return mode; }, get bal() { return bal; }, get lastWin() { return lastWin; }, get game() { return game; }, get stats() { return stats; }, get pack() { return pack; }, get bonus() { return bonusRun; }, get fx() { return FX_; }, get check() { return CHECK; }, arm(list, jp) { (list || []).forEach(k => armed.signs.add(k)); armed.jp = jp || null; }, get armed() { return { signs: [...armed.signs], jp: armed.jp }; }, get wheel() { return wheel; }, get seqName() { return seq.length ? (seq[0].name || seq[0].dur) : null; }, tap() { if (mode === 'idle') startGame(); else skip(); } };
 
 // ---------- boot ----------
 Promise.all([loadAssets(), document.fonts && document.fonts.load ? Promise.all([document.fonts.load('20px Bangers'), document.fonts.load('20px Creepster')]).catch(() => { }) : Promise.resolve(), initPlanner()]).then(() => {
