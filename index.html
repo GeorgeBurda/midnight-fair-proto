@@ -1466,6 +1466,7 @@ function topbar() { document.getElementById('bal').textContent = fmt(bal); docum
 function save() { store.set('bal', bal); store.set('signs', signFill.map(v => Math.min(0.92, v))); }
 
 function rollGame() {
+  applyArmed();
   const st = rng.state(); const opt = {}; if (forceBonus) opt.forceBonus = forceBonus; if (forceJP) opt.forceJackpot = forceJP; if (PARAM.chain) opt.forceChain = PARAM.chain;
   const base = L.playBase(rng, opt); let bonus = null; if (base.trig) bonus = L.playBonus(rng, base.trig, opt);
   forceBonus = null; forceJP = null;
@@ -1512,7 +1513,23 @@ function skip() {
   if (mode === 'base' || mode === 'bonus') { if (!pack) return; const tEnd = pack.p.tEnd + 0.01; advancePack(tEnd, true); pack.t = tEnd; FX_.flyers.forEach(fl => { fl.t = fl.dur; }); return; }
   if (seq.length) { seq[0].skip = true; }
 }
-cv.addEventListener('pointerdown', (e) => { e.preventDefault(); if (mode === 'idle') startGame(); else skip(); }, { passive: false });
+// ---- cheat: tap a neon sign to arm its bonus for the next game (2 signs = combo, 3 = Midnight); tap a plush to arm a wheel ride onto that jackpot ----
+const armed = { signs: new Set(), jp: null };
+function hitTest(e) { const r = cv.getBoundingClientRect(); const sx = ((e.clientX - r.left) * CW / r.width - OX) / K, sy = ((e.clientY - r.top) * CH / r.height - OY) / K;
+  if (sy >= SIGN_Y && sy <= SIGN_Y + SIGN_H + 6) for (let i = 0; i < 3; i++) if (Math.abs(sx - SIGN_X[i]) <= 54) return { sign: SIGN_KEYS[i] };
+  if (sy >= SHELF_Y + 4 && sy <= STH) { let best = null, bd = 1e9; for (const p of PLUSH) { const d = Math.abs(sx - p.x); if (d < bd) { bd = d; best = p; } } if (best && bd <= 44) return { jp: best.lv }; }
+  return null; }
+function cheatTap(h) {
+  if (mode === 'bonus') { toast('CHEATS: WAIT FOR THE BONUS TO END'); return; }
+  if (h.sign) { if (armed.signs.has(h.sign)) armed.signs.delete(h.sign); else armed.signs.add(h.sign); tone(armed.signs.has(h.sign) ? 1320 : 520, 0.12, 'square', 0.04); }
+  else { if (armed.jp === h.jp) armed.jp = null; else { armed.jp = h.jp; if (!armed.signs.size) armed.signs.add(SIGN_KEYS[Math.floor(Math.random() * 3)]); } tone(armed.jp ? 1568 : 520, 0.15, 'square', 0.04); }
+  const n = armed.signs.size; toast(n || armed.jp ? 'ARMED: ' + (n === 3 ? 'MIDNIGHT' : [...armed.signs].map(k => k.toUpperCase()).join(' + ')) + (armed.jp ? ' + ' + armed.jp.toUpperCase() + ' JACKPOT' : '') : 'CHEAT DISARMED');
+}
+function applyArmed() { // called right before the next game is rolled (math untouched otherwise)
+  if (!armed.signs.size && !armed.jp) return; let set = [...armed.signs]; if (!set.length) set = [SIGN_KEYS[Math.floor(Math.random() * 3)]];
+  forceBonus = L.parseCombo(set.join('+')); if (armed.jp) forceJP = armed.jp; armed.signs.clear(); armed.jp = null;
+}
+cv.addEventListener('pointerdown', (e) => { e.preventDefault(); const h = hitTest(e); if (h) { audioInit(); cheatTap(h); return; } if (mode === 'idle') startGame(); else skip(); }, { passive: false });
 window.addEventListener('keydown', (e) => { if (e.code === 'Space' || e.code === 'Enter') { if (mode === 'idle') startGame(); else skip(); } if (e.key === 'm') { AU.on = !AU.on; if (AU.master) AU.master.gain.value = AU.on ? 0.55 : 0; } });
 
 // ---------- pack playback ----------
@@ -1732,6 +1749,7 @@ function draw(time) {
   ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
   for (const s of FX_.sparks) if (s.spr === 'coin') { ctx.save(); ctx.translate(s.x, s.y); ctx.scale(Math.abs(Math.cos(s.rot)) * 0.9 + 0.1, 1); ctx.drawImage(SPR.coin, -s.s, -s.s, s.s * 2, s.s * 2); ctx.restore(); }
   // jackpot plush highlight
+  drawArmed(time);
   if (FX_.jpHi) { const p = PLUSH.find(q => q.lv === FX_.jpHi.lv); const tt = FX_.jpHi.t; const lift = Math.abs(Math.sin(tt * 6)) * 6 * Math.max(0, 1 - tt / 4); ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.6 + 0.4 * Math.sin(tt * 8); dGL(GL(JP_GLOW[p.lv], 100, 100), p.x - 50, STH - 12 - p.h / 2 - 50, 100, 100); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; drawPlush(ctx, p, 1.08, lift); }
   // floaters
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
@@ -1743,12 +1761,17 @@ function draw(time) {
   if (mode === 'idle' && !FX_.celeb) { ctx.globalAlpha = 0.6 + 0.4 * Math.sin(time * 3); ctx.font = '15px Bangers'; ctx.fillStyle = '#d6ffb0'; ctx.strokeStyle = 'rgba(10,0,20,0.9)'; ctx.lineWidth = 3; const t = 'TAP TO RELEASE 10 WISPS'; ctx.strokeText(t, FX + 165, FY + 100); ctx.fillText(t, FX + 165, FY + 100); ctx.globalAlpha = 1; }
   if (FX_.toast) { ctx.globalAlpha = Math.min(1, (2 - FX_.toast.t) * 2); ctx.fillStyle = 'rgba(20,8,40,0.9)'; rr(ctx, 86, 300, 200, 30, 12); ctx.fill(); ctx.fillStyle = '#ffe2a8'; ctx.font = '14px Bangers'; ctx.fillText(FX_.toast.text, 186, 315); ctx.globalAlpha = 1; }
 }
+function armTag(x, y, col, time) { const pu = 0.5 + 0.5 * Math.sin(time * 7); ctx.globalAlpha = 0.85 + 0.15 * pu; ctx.fillStyle = 'rgba(12,4,26,0.92)'; rr(ctx, x - 25, y - 7.5, 50, 15, 7.5); ctx.fill(); ctx.strokeStyle = col; ctx.lineWidth = 1 + pu; ctx.stroke(); ctx.globalAlpha = 1; txt('ARMED', 10, 'Bangers', col, '', 0, x, y + 0.5, 'center'); }
+function drawArmed(time) {
+  for (let i = 0; i < 3; i++) { const k = SIGN_KEYS[i]; if (armed.signs.has(k)) armTag(SIGN_X[i], SIGN_Y + SIGN_H + 4, BOOTH_COL[k], time); }
+  if (armed.jp) { const p = PLUSH.find(q => q.lv === armed.jp); ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.45 + 0.25 * Math.sin(time * 6); dGL(GL(JP_GLOW[p.lv], 96, 96), p.x - 48, STH - 12 - p.h / 2 - 48, 96, 96); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; armTag(p.x, STH - 12 - p.h - 4, JP_COL[p.lv], time); }
+}
 function drawSigns(time) {
   for (let i = 0; i < 3; i++) {
     const k = SIGN_KEYS[i], sp = SPR.signs[k]; if (!sp) continue; const dim = sp.dim, lit = sp.lit;
     const h = SIGN_H, w = sp.lit.uw, x = SIGN_X[i] - w / 2, y = SIGN_Y;
     const fill = signFill[i], fl = FX_.signFlash ? FX_.signFlash[i] : 0;
-    const on = (bonusRun && bonusRun.set.includes(k)) ? 1 : 0;
+    const isArmed = armed.signs.has(k); const on = ((bonusRun && bonusRun.set.includes(k)) || isArmed) ? 1 : 0;
     let a = 0.08 + 0.8 * Math.min(1, fill); if (fill < 1) a *= 0.9 + 0.1 * Math.sin(time * (7 + i) + i * 2); a = Math.max(a, on * (0.85 + 0.15 * Math.sin(time * 5)));
     I0(); blitS(signC(k, Math.min(1, a)), x, y); IS();
     if (fl > 0 || (on && QL.lvl === 0)) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = Math.min(1, fl * 0.9 + on * 0.18); I0(); blitS(lit, x, y); IS(); if (fl > 0) { const spr = GL(k === 'train' ? 'teal' : k === 'crypt' ? 'gold' : 'orange', w * 1.6, h + 20); ctx.globalAlpha = Math.min(1, fl); dGL(spr, SIGN_X[i] - w * 0.8, y - 10, w * 1.6, h + 20); } ctx.globalCompositeOperation = 'source-over'; }
@@ -1880,7 +1903,7 @@ function debugPanel() {
 }
 
 // ---------- test hooks ----------
-window.__QL = () => QL; window.__A = A; window.__SPR = SPR; window.__mf = { get mode() { return mode; }, get bal() { return bal; }, get lastWin() { return lastWin; }, get game() { return game; }, get stats() { return stats; }, get pack() { return pack; }, get bonus() { return bonusRun; }, get fx() { return FX_; }, get wheel() { return wheel; }, get seqName() { return seq.length ? (seq[0].name || seq[0].dur) : null; }, tap() { if (mode === 'idle') startGame(); else skip(); } };
+window.__QL = () => QL; window.__A = A; window.__SPR = SPR; window.__mf = { get mode() { return mode; }, get bal() { return bal; }, get lastWin() { return lastWin; }, get game() { return game; }, get stats() { return stats; }, get pack() { return pack; }, get bonus() { return bonusRun; }, get fx() { return FX_; }, get armed() { return { signs: [...armed.signs], jp: armed.jp }; }, get wheel() { return wheel; }, get seqName() { return seq.length ? (seq[0].name || seq[0].dur) : null; }, tap() { if (mode === 'idle') startGame(); else skip(); } };
 
 // ---------- boot ----------
 Promise.all([loadAssets(), document.fonts && document.fonts.load ? Promise.all([document.fonts.load('20px Bangers'), document.fonts.load('20px Creepster')]).catch(() => { }) : Promise.resolve(), initPlanner()]).then(() => {
