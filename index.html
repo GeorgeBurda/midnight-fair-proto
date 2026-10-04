@@ -1877,7 +1877,7 @@ function debugPanel() {
 }
 
 // ---------- test hooks ----------
-window.__QL = () => QL; window.__A = A; window.__SPR = SPR; window.__mf = { get mode() { return mode; }, get bal() { return bal; }, get lastWin() { return lastWin; }, get game() { return game; }, get stats() { return stats; }, get pack() { return pack; }, get bonus() { return bonusRun; }, get fx() { return FX_; }, get seqName() { return seq.length ? (seq[0].name || seq[0].dur) : null; }, tap() { if (mode === 'idle') startGame(); else skip(); } };
+window.__QL = () => QL; window.__A = A; window.__SPR = SPR; window.__mf = { get mode() { return mode; }, get bal() { return bal; }, get lastWin() { return lastWin; }, get game() { return game; }, get stats() { return stats; }, get pack() { return pack; }, get bonus() { return bonusRun; }, get fx() { return FX_; }, get wheel() { return wheel; }, get seqName() { return seq.length ? (seq[0].name || seq[0].dur) : null; }, tap() { if (mode === 'idle') startGame(); else skip(); } };
 
 // ---------- boot ----------
 Promise.all([loadAssets(), document.fonts && document.fonts.load ? Promise.all([document.fonts.load('20px Bangers'), document.fonts.load('20px Creepster')]).catch(() => { }) : Promise.resolve(), initPlanner()]).then(() => {
