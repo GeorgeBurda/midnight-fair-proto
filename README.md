@@ -11,3 +11,7 @@ Single self-contained `index.html` + `assets/`. Source and test tooling live out
 
 Cheat (prototype only): tap a neon sign to arm its bonus for the next game (tap 2 signs = combo, all 3 = Midnight; tap again to disarm).
 Tap a plush to arm a guaranteed wheel ride onto that jackpot in the next bonus (a random sign is armed too if none is). Cheat taps are ignored while a bonus runs.
+
+Board physics is tuned so that unsteered wisps (natural launch distribution along the top rail) land with the same slot
+frequencies as the RNG weights (max deviation ~5% relative). The whole game result is decided at the tap, before the first
+wisp launches; steering only animates it (`?debug=1` shows the pre-decided result and a live landing check).

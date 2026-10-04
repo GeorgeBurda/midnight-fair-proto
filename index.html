@@ -180,13 +180,16 @@ const G = {
   WX: 165, WY: 196, WR: 52, GATE_Y: 139, GATE_R: 7,
   DIV_TOP: 360, END_Y: 380, FLOOR: 408, START_Y: 14,
   GRAV: 980, DT: 1 / 240, E_NAIL: 0.35, E_WALL: 0.5, E_WHEEL: 0.5, E_PUMP: 0.6, FRIC: 0.75, VMAX: 720,
+  GATE_VCAP: 163, GATE_VCAP_M: 209, // open gate is a soft flap: it only swallows a wisp arriving slower than this (bonus / Midnight); faster wisps bounce off
+  PUMP_VB: 220, // a pumpkin only cracks on a hit faster than this; softer touches bounce off
   TMAX: 9, REC_EVERY: 4, DRAGX: 1 - 1.5 / 240, GFRIC: 0.96, // record at 60 Hz
 };
-G.SLOTS = 11; G.SW = G.FW / G.SLOTS;
+G.SLOTS = 11; G.SW = G.FW / G.SLOTS; G.PUMP_VB2 = G.PUMP_VB * G.PUMP_VB;
 // side guide rails (funnel wisps toward the centre; a narrow channel along each wall leads to the x20 pockets)
 G.SEGS = [];
 function addGuides(list) { for (const g of list) { G.SEGS.push({ ax: g[0], ay: g[1], bx: g[2], by: g[3], r: 2 }); G.SEGS.push({ ax: G.FW - g[0], ay: g[1], bx: G.FW - g[2], by: g[3], r: 2 }); } }
-addGuides(globalThis.MF_GUIDES || [[16, 258, 40, 282], [80, 246, 114, 270]]);
+// geometry tuned (tune/anneal.js) so that unsteered physics with the launch distribution below matches the RNG slot weights
+addGuides(globalThis.MF_GUIDES || [[16, 263, 43, 281], [63, 256, 100, 280], [88, 113, 123, 136]]);
 for (const sg of G.SEGS) { sg.minY = Math.min(sg.ay, sg.by) - 12; sg.maxY = Math.max(sg.ay, sg.by) + 12; sg.dx = sg.bx - sg.ax; sg.dy = sg.by - sg.ay; sg.l2 = sg.dx * sg.dx + sg.dy * sg.dy; }
 function segDist(sg, x, y) { let u = ((x - sg.ax) * sg.dx + (y - sg.ay) * sg.dy) / sg.l2; u = u < 0 ? 0 : u > 1 ? 1 : u; return [sg.ax + u * sg.dx, sg.ay + u * sg.dy]; }
 // nail lattice: present[row][k]; row even: x=15+30k (k 0..10); odd: x=30k (k 1..10)
@@ -218,7 +221,7 @@ function slotCenter(s) { return (s + 0.5) * G.SW; }
 const OUT = { code: 0, t: 0, x: 0, y: 0, vx: 0, vy: 0, pump: -1, nImp: 0 };
 function sim(x, y, vx, vy, t0, env, rec, stopAtImpact) {
   const R = G.R, dt = G.DT, rr = R + G.NR, rr2 = rr * rr, pr = R + G.PR, pr2 = pr * pr;
-  const gateOpen = env && env.gate === 'open', pumps = env && env.pumps, wantPump = env && env.targetPump, wantGate = env && env.targetGate;
+  const gateOpen = env && env.gate === 'open', vcap = env && env.gateMode === 'midnight' ? G.GATE_VCAP_M : G.GATE_VCAP, vcap2 = vcap * vcap, pumps = env && env.pumps, wantPump = env && env.targetPump, wantGate = env && env.targetGate;
   let t = t0, step = 0, sx = x, sy = y, stuckT = t0 + 0.75, nImp = 0;
   const wr = G.WR + R, wr2 = wr * wr, gr = G.GATE_R + R, gr2 = gr * gr;
   while (true) {
@@ -261,7 +264,7 @@ function sim(x, y, vx, vy, t0, env, rec, stopAtImpact) {
         const p = pumps[i]; if (t >= p.tb) continue;
         const dx = x - p.x, dy = y - p.y, d2 = dx * dx + dy * dy;
         if (d2 < pr2) {
-          if (env.pumpSolid) { const d = Math.sqrt(d2) || 1e-6, ux = dx / d, uy = dy / d; x += ux * (pr - d); y += uy * (pr - d); const vn = vx * ux + vy * uy; if (vn < 0) { vx -= (1 + G.E_PUMP) * vn * ux; vy -= (1 + G.E_PUMP) * vn * uy; } continue; }
+          if (env.pumpSolid || p.solid || vx * vx + vy * vy < G.PUMP_VB2) { const d = Math.sqrt(d2) || 1e-6, ux = dx / d, uy = dy / d; x += ux * (pr - d); y += uy * (pr - d); const vn = vx * ux + vy * uy; if (vn < 0) { vx -= (1 + G.E_PUMP) * vn * ux; vy -= (1 + G.E_PUMP) * vn * uy; } if (uy < -0.9) vx += (ux >= 0 ? 1 : -1) * 35; continue; } // round, knobbly pumpkin: nothing rests on its top
           if (wantPump && !p.claimed) { OUT.code = -4; OUT.pump = i; OUT.t = t; OUT.x = x; OUT.y = y; OUT.vx = vx; OUT.vy = vy; OUT.nImp = nImp; if (rec) rec.end(t, x, y); return OUT; }
           OUT.code = -2; OUT.t = t; OUT.x = x; OUT.y = y; if (rec) rec.end(t, x, y); return OUT;
         }
@@ -272,7 +275,7 @@ function sim(x, y, vx, vy, t0, env, rec, stopAtImpact) {
       if (d2 < wr2 + 400) {
         const gdx = x - G.WX, gdy = y - G.GATE_Y, g2 = gdx * gdx + gdy * gdy;
         if (g2 < gr2) {
-          if (gateOpen) {
+          if (gateOpen && vx * vx + vy * vy <= vcap2) {
             if (wantGate) { OUT.code = -3; OUT.t = t; OUT.x = x; OUT.y = y; OUT.vx = vx; OUT.vy = vy; OUT.nImp = nImp; if (rec) rec.end(t, x, y); return OUT; }
             OUT.code = -2; OUT.t = t; OUT.x = x; OUT.y = y; if (rec) rec.end(t, x, y); return OUT;
           }
@@ -315,8 +318,16 @@ Rec.prototype.end = function (t, x, y) { const n = this.pts.length; if (this.pts
 
 // ---- start conditions ----
 // 'top': wisp leaves the top rail at (x0, START_Y) with velocity (vx0, vy0) (it travelled right->left along the rail)
-const TOP = { x0: 120, x1: 210, v0: -60, v1: 0, w1: 50 };
-function randTop(rng, p) { p[0] = TOP.x0 + rng() * (TOP.x1 - TOP.x0); p[1] = TOP.v0 + rng() * (TOP.v1 - TOP.v0); p[2] = rng() * TOP.w1; return p; }
+// natural launch distribution: x0 piecewise-constant over 10-unit bins from 20 to 310 (a smooth bell centred near x=170),
+// vx uniform [-60, 0] (the wisp arrives from the right along the top rail), vy uniform [0, 50]
+const TOP = { x0: 20, x1: 310, v0: -60, v1: 0, w1: 50, BW: 10,
+  BINW: [8, 8, 13, 35, 74, 134, 214, 296, 382, 469, 546, 606, 651, 684, 701, 705, 692, 667, 633, 582, 514, 431, 347, 260, 171, 100, 49, 19, 6] };
+// Multiball board (12 pumpkins standing): pumpkins scatter wisps outwards, so its natural launch distribution is a bit narrower
+TOP.BINW_PUMP = [17, 21, 27, 15, 26, 57, 120, 195, 294, 431, 570, 674, 754, 820, 843, 836, 804, 761, 698, 612, 496, 360, 244, 146, 79, 33, 19, 24, 23];
+function cum(w) { const o = []; let c = 0; const t = w.reduce((a, b) => a + b, 0); for (const v of w) { c += v / t; o.push(c); } return o; }
+TOP.CUM = cum(TOP.BINW); TOP.CUM_PUMP = cum(TOP.BINW_PUMP); let BOARD_PUMP = false;
+function randX0(rng, pump) { const C = (pump === undefined ? BOARD_PUMP : pump) ? TOP.CUM_PUMP : TOP.CUM; const u = rng(); let i = 0; while (i < C.length - 1 && u > C[i]) i++; return TOP.x0 + (i + rng()) * TOP.BW; }
+function randTop(rng, p, pump) { p[0] = randX0(rng, pump); p[1] = TOP.v0 + rng() * (TOP.v1 - TOP.v0); p[2] = rng() * TOP.w1; return p; }
 // 'point': burst / wheel exit: angle (rad, 0 = right, -PI/2 = up) and speed
 function startState(spec, p, out) {
   if (spec.kind === 'top') { out[0] = p[0]; out[1] = G.START_Y; out[2] = p[1]; out[3] = p[2]; }
@@ -329,6 +340,8 @@ function randPoint(rng, spec, p) {
 
 // ---- bias tables for 'top' starts: start conditions that naturally reach each slot / the gate ----
 let TABLE = null;
+// precomputed natural gate-capture launches for this geometry (soft flap, GATE_VCAP) — avoids a slow fill at startup
+const GATE_SEEDS = [[86.545,-43.286,33.923],[226.112,-34.693,14.754],[221.953,-16.4,23.613],[116.816,-21.555,23.714],[220.658,-10.62,5.62],[228.761,-48.379,36.648],[232.297,-55.076,14.731],[97.845,-5.836,11.879],[94.427,-53.878,43.833],[132.735,-43.353,49.305],[227.832,-41.309,9.692],[90.21,-57.197,20.037],[248.745,-5.259,33.547],[221.159,-11.283,11.126],[228.592,-42.819,10.599],[88.556,-27.502,47.901],[228.549,-48.459,46.211],[116.735,-22.802,20.47],[113.409,-8.55,38.439],[219.388,-5.103,37.696],[120.198,-38.598,42.953],[236.364,-10.222,32.705],[230.28,-48.335,33.534],[128.972,-29.161,47.729],[235.26,-7.003,46.567],[121.774,-45.833,39.574],[246.152,-45.732,42.414],[240.075,-23.895,37.653],[230.281,-53.055,23.139],[91.148,-39.879,48.3],[219.521,-5.617,28.163],[113.944,-10.885,29.284],[237.848,-17.59,36.883],[238.054,-14.857,15.927],[238.303,-17.316,37.229],[223.29,-22.918,47.525],[218.951,-4.095,23.22],[259.848,-52.17,19.149],[226.455,-38.237,46.649],[241.061,-27.819,42.062],[115.03,-21.794,48.426],[220.681,-11.023,10.063],[115.318,-16.31,7.319],[160.325,-26.002,19.659],[241.809,-31.962,36.525],[124.331,-52.911,15.231],[174.434,-2.023,9.869],[113.721,-9.829,38.395],[223.819,-24.949,47.378],[226.232,-35.915,47.339],[227.659,-40.798,33.136],[249.005,-7.567,46.928],[246.557,-46.998,46.918],[242.859,-32.519,20.073],[265.052,-49.132,6.157],[221.409,-43.331,21.923],[157.404,-5.167,18.947],[241.412,-28.173,47.237],[122.342,-4.106,22.581],[227.559,-37.342,2.489]];
 function buildTable(rng, n) {
   const tab = { slot: [], gate: [] }; for (let s = 0; s < 11; s++) tab.slot.push([]);
   const p = [0, 0, 0], st = [0, 0, 0, 0];
@@ -341,6 +354,8 @@ function buildTable(rng, n) {
   }
   // make sure every slot has entries (edge slots): targeted random fill
   for (let s = 0; s < 11; s++) { let guard = 0; while (tab.slot[s].length < 40 && guard++ < 200000) { randTop(rng, p); if (s <= 1) p[0] = TOP.x0 + rng() * 110; if (s >= 9) p[0] = TOP.x1 - rng() * 110; startState({ kind: 'top' }, p, st); const o = sim(st[0], st[1], st[2], st[3], 0, null, null, false); if (o.code === s) tab.slot[s].push(p.slice()); } }
+  if (tab.gate.length < 60 && GATE_SEEDS) for (const q of GATE_SEEDS) { if (tab.gate.length >= 60) break; tab.gate.push(q.slice()); }
+  { let guard = 0; while (tab.gate.length < 20 && guard++ < 60000) { randTop(rng, p); startState({ kind: 'top' }, p, st); const o2 = sim(st[0], st[1], st[2], st[3], 0, { gate: 'open', targetGate: true }, null, false); if (o2.code === -3) tab.gate.push(p.slice()); } }
   TABLE = tab; return tab;
 }
 function gauss(rng) { return (rng() + rng() + rng() - 1.5) * 1.41; }
@@ -414,6 +429,7 @@ function correct(rec, slot) {
 // spec: start {kind:'top'} or {kind:'point', x, y, a0,a1,s0,s1}; t0: start time
 // target: {slot:k} | {gate:true} | {pump:true}; env: {gate, pumps}
 function search(rng, spec, t0, target, env, budget, launch, railFn) {
+  BOARD_PUMP = !!(env && env.pumps);
   const T0 = (q) => railFn ? launch + railFn(q[0]) : t0;
   budget = budget || 500;
   const p = [0, 0, 0], st = [0, 0, 0, 0];
@@ -454,7 +470,7 @@ function search(rng, spec, t0, target, env, budget, launch, railFn) {
   return { method: 'fail', n, rec: lastRec, out: lastO };
 }
 
-const API = { TOP, G, nails, present, sim, search, buildTable, Rec, slotOf, slotCenter, correct, rowX, get TABLE() { return TABLE; }, set TABLE(t) { TABLE = t; } };
+const API = { TOP, G, randTop, randX0, nails, present, sim, search, buildTable, Rec, slotOf, slotCenter, correct, rowX, get TABLE() { return TABLE; }, set TABLE(t) { TABLE = t; } };
 if (typeof module !== 'undefined' && module.exports) module.exports = API; else root.MFPhys = API;
 })(typeof self !== 'undefined' ? self : this);
 
@@ -468,7 +484,9 @@ const EXIT = { x: G.WX, y: G.WY + G.WR + 7 };
 function railTime(x0) { return 0.38 + (G.FW - x0) / 700; } // up the right rail + along the top rail to x0
 
 // candidate pumpkin positions: lattice nails in rows 1..8 away from the wheel and walls
-const PUMP_CAND = G.nails.filter(n => n.row >= 1 && n.row <= 7 && n.x > 20 && n.x < G.FW - 20 && Math.hypot(n.x - G.WX, n.y - G.WY) > G.WR + 26);
+function segD(sg, x, y) { let u = ((x - sg.ax) * sg.dx + (y - sg.ay) * sg.dy) / sg.l2; u = Math.max(0, Math.min(1, u)); return Math.hypot(x - sg.ax - u * sg.dx, y - sg.ay - u * sg.dy); }
+const PUMP_CAND = G.nails.filter(n => n.row >= 1 && n.row <= 7 && n.x > 20 && n.x < G.FW - 20 && Math.hypot(n.x - G.WX, n.y - G.WY) > G.WR + 26
+  && G.SEGS.every(sg => segD(sg, n.x, n.y) > G.PR + sg.r + 2 * G.R + 3)); // never wedge a wisp between a pumpkin and a guide rail
 function pumpLayout(rng, count) {
   for (let k = 0; k < 50; k++) { const o = pumpLayout1(rng, count); if (o.length >= count) return o; }
   return pumpLayout1(rng, count);
@@ -500,7 +518,7 @@ function mulberry(seed) { let a = seed >>> 0; return function () { a = (a + 0x6D
 function tryPlan(spec, rng) {
   const n = spec.wisps.length, ps = spec.packSize || n, iv = spec.interval || 0.42;
   const pumps = spec.pumps ? spec.pumps.map(p => Object.assign({}, p, { tb: Infinity, claimed: false })) : null;
-  const env = { gate: spec.gateOpen ? 'open' : 'closed', pumps };
+  const env = { gate: spec.gateOpen ? 'open' : 'closed', gateMode: spec.gateMode || 'bonus', pumps };
   const stats = { main: 0, fallback: 0, corrector: 0, fail: 0, cand: 0 };
   const flights = [];
   const note = (r) => { stats[r.method]++; stats.cand += r.n; if (r.bump || (r.out && r.out.bump)) stats.bump = (stats.bump || 0) + 1; };
@@ -529,7 +547,7 @@ function tryPlan(spec, rng) {
         // burst: parent + 2 new wisps fly out of the pumpkin
         const ang = Math.atan2(r.out.y - p.y, r.out.x - p.x);
         const sx = p.x + Math.cos(ang) * (G.PR + G.R + 0.6), sy = p.y + Math.sin(ang) * (G.PR + G.R + 0.6);
-        for (let c = 0; c < 3; c++) children.push({ kind: 'point', x: sx, y: sy, t0: r.out.t + 0.02, a0: ang - 1.45, a1: ang + 1.45, s0: 140, s1: 380, child: true, from: pi });
+        for (let c = 0; c < 3; c++) children.push({ kind: 'point', x: sx, y: sy, t0: r.out.t + 0.02, a0: -Math.PI / 2 - 0.6, a1: -Math.PI / 2 + 0.6, s0: 150, s1: 300, child: true, from: pi }); // burst fountain: thrown upwards
         // shuffle children so the chain is not always the same branch
         for (let i = children.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); const t = children[i]; children[i] = children[j]; children[j] = t; }
       } else { seg.triedBreak = true; finals.push(seg); }
@@ -604,7 +622,7 @@ function purePack(spec) {
   const rng = mulberry(spec.presSeed), n = spec.wisps.length, iv = spec.interval || 0.42, flights = [];
   for (let i = 0; i < n; i++) {
     for (let k = 0; k < 50; k++) {
-      const x0 = P.TOP.x0 + rng() * (P.TOP.x1 - P.TOP.x0), vx = P.TOP.v0 + rng() * (P.TOP.v1 - P.TOP.v0), vy = rng() * P.TOP.w1;
+      const x0 = P.randX0(rng), vx = P.TOP.v0 + rng() * (P.TOP.v1 - P.TOP.v0), vy = rng() * P.TOP.w1;
       const t0 = i * iv + railTime(x0); const rec = new P.Rec(t0, x0, G.START_Y); const o = P.sim(x0, G.START_Y, vx, vy, t0, { gate: 'closed' }, rec, false);
       if (o.code >= 0) { const f = mkFlight({ kind: 'top', launch: i * iv, init: true, idx: i }, { rec, method: 'pure' }, i, 'slot'); f.landed = o.code; flights.push(f); break; }
     }
@@ -784,13 +802,16 @@ const G = {
   WX: 165, WY: 196, WR: 52, GATE_Y: 139, GATE_R: 7,
   DIV_TOP: 360, END_Y: 380, FLOOR: 408, START_Y: 14,
   GRAV: 980, DT: 1 / 240, E_NAIL: 0.35, E_WALL: 0.5, E_WHEEL: 0.5, E_PUMP: 0.6, FRIC: 0.75, VMAX: 720,
+  GATE_VCAP: 163, GATE_VCAP_M: 209, // open gate is a soft flap: it only swallows a wisp arriving slower than this (bonus / Midnight); faster wisps bounce off
+  PUMP_VB: 220, // a pumpkin only cracks on a hit faster than this; softer touches bounce off
   TMAX: 9, REC_EVERY: 4, DRAGX: 1 - 1.5 / 240, GFRIC: 0.96, // record at 60 Hz
 };
-G.SLOTS = 11; G.SW = G.FW / G.SLOTS;
+G.SLOTS = 11; G.SW = G.FW / G.SLOTS; G.PUMP_VB2 = G.PUMP_VB * G.PUMP_VB;
 // side guide rails (funnel wisps toward the centre; a narrow channel along each wall leads to the x20 pockets)
 G.SEGS = [];
 function addGuides(list) { for (const g of list) { G.SEGS.push({ ax: g[0], ay: g[1], bx: g[2], by: g[3], r: 2 }); G.SEGS.push({ ax: G.FW - g[0], ay: g[1], bx: G.FW - g[2], by: g[3], r: 2 }); } }
-addGuides(globalThis.MF_GUIDES || [[16, 258, 40, 282], [80, 246, 114, 270]]);
+// geometry tuned (tune/anneal.js) so that unsteered physics with the launch distribution below matches the RNG slot weights
+addGuides(globalThis.MF_GUIDES || [[16, 263, 43, 281], [63, 256, 100, 280], [88, 113, 123, 136]]);
 for (const sg of G.SEGS) { sg.minY = Math.min(sg.ay, sg.by) - 12; sg.maxY = Math.max(sg.ay, sg.by) + 12; sg.dx = sg.bx - sg.ax; sg.dy = sg.by - sg.ay; sg.l2 = sg.dx * sg.dx + sg.dy * sg.dy; }
 function segDist(sg, x, y) { let u = ((x - sg.ax) * sg.dx + (y - sg.ay) * sg.dy) / sg.l2; u = u < 0 ? 0 : u > 1 ? 1 : u; return [sg.ax + u * sg.dx, sg.ay + u * sg.dy]; }
 // nail lattice: present[row][k]; row even: x=15+30k (k 0..10); odd: x=30k (k 1..10)
@@ -822,7 +843,7 @@ function slotCenter(s) { return (s + 0.5) * G.SW; }
 const OUT = { code: 0, t: 0, x: 0, y: 0, vx: 0, vy: 0, pump: -1, nImp: 0 };
 function sim(x, y, vx, vy, t0, env, rec, stopAtImpact) {
   const R = G.R, dt = G.DT, rr = R + G.NR, rr2 = rr * rr, pr = R + G.PR, pr2 = pr * pr;
-  const gateOpen = env && env.gate === 'open', pumps = env && env.pumps, wantPump = env && env.targetPump, wantGate = env && env.targetGate;
+  const gateOpen = env && env.gate === 'open', vcap = env && env.gateMode === 'midnight' ? G.GATE_VCAP_M : G.GATE_VCAP, vcap2 = vcap * vcap, pumps = env && env.pumps, wantPump = env && env.targetPump, wantGate = env && env.targetGate;
   let t = t0, step = 0, sx = x, sy = y, stuckT = t0 + 0.75, nImp = 0;
   const wr = G.WR + R, wr2 = wr * wr, gr = G.GATE_R + R, gr2 = gr * gr;
   while (true) {
@@ -865,7 +886,7 @@ function sim(x, y, vx, vy, t0, env, rec, stopAtImpact) {
         const p = pumps[i]; if (t >= p.tb) continue;
         const dx = x - p.x, dy = y - p.y, d2 = dx * dx + dy * dy;
         if (d2 < pr2) {
-          if (env.pumpSolid) { const d = Math.sqrt(d2) || 1e-6, ux = dx / d, uy = dy / d; x += ux * (pr - d); y += uy * (pr - d); const vn = vx * ux + vy * uy; if (vn < 0) { vx -= (1 + G.E_PUMP) * vn * ux; vy -= (1 + G.E_PUMP) * vn * uy; } continue; }
+          if (env.pumpSolid || p.solid || vx * vx + vy * vy < G.PUMP_VB2) { const d = Math.sqrt(d2) || 1e-6, ux = dx / d, uy = dy / d; x += ux * (pr - d); y += uy * (pr - d); const vn = vx * ux + vy * uy; if (vn < 0) { vx -= (1 + G.E_PUMP) * vn * ux; vy -= (1 + G.E_PUMP) * vn * uy; } if (uy < -0.9) vx += (ux >= 0 ? 1 : -1) * 35; continue; } // round, knobbly pumpkin: nothing rests on its top
           if (wantPump && !p.claimed) { OUT.code = -4; OUT.pump = i; OUT.t = t; OUT.x = x; OUT.y = y; OUT.vx = vx; OUT.vy = vy; OUT.nImp = nImp; if (rec) rec.end(t, x, y); return OUT; }
           OUT.code = -2; OUT.t = t; OUT.x = x; OUT.y = y; if (rec) rec.end(t, x, y); return OUT;
         }
@@ -876,7 +897,7 @@ function sim(x, y, vx, vy, t0, env, rec, stopAtImpact) {
       if (d2 < wr2 + 400) {
         const gdx = x - G.WX, gdy = y - G.GATE_Y, g2 = gdx * gdx + gdy * gdy;
         if (g2 < gr2) {
-          if (gateOpen) {
+          if (gateOpen && vx * vx + vy * vy <= vcap2) {
             if (wantGate) { OUT.code = -3; OUT.t = t; OUT.x = x; OUT.y = y; OUT.vx = vx; OUT.vy = vy; OUT.nImp = nImp; if (rec) rec.end(t, x, y); return OUT; }
             OUT.code = -2; OUT.t = t; OUT.x = x; OUT.y = y; if (rec) rec.end(t, x, y); return OUT;
           }
@@ -919,8 +940,16 @@ Rec.prototype.end = function (t, x, y) { const n = this.pts.length; if (this.pts
 
 // ---- start conditions ----
 // 'top': wisp leaves the top rail at (x0, START_Y) with velocity (vx0, vy0) (it travelled right->left along the rail)
-const TOP = { x0: 120, x1: 210, v0: -60, v1: 0, w1: 50 };
-function randTop(rng, p) { p[0] = TOP.x0 + rng() * (TOP.x1 - TOP.x0); p[1] = TOP.v0 + rng() * (TOP.v1 - TOP.v0); p[2] = rng() * TOP.w1; return p; }
+// natural launch distribution: x0 piecewise-constant over 10-unit bins from 20 to 310 (a smooth bell centred near x=170),
+// vx uniform [-60, 0] (the wisp arrives from the right along the top rail), vy uniform [0, 50]
+const TOP = { x0: 20, x1: 310, v0: -60, v1: 0, w1: 50, BW: 10,
+  BINW: [8, 8, 13, 35, 74, 134, 214, 296, 382, 469, 546, 606, 651, 684, 701, 705, 692, 667, 633, 582, 514, 431, 347, 260, 171, 100, 49, 19, 6] };
+// Multiball board (12 pumpkins standing): pumpkins scatter wisps outwards, so its natural launch distribution is a bit narrower
+TOP.BINW_PUMP = [17, 21, 27, 15, 26, 57, 120, 195, 294, 431, 570, 674, 754, 820, 843, 836, 804, 761, 698, 612, 496, 360, 244, 146, 79, 33, 19, 24, 23];
+function cum(w) { const o = []; let c = 0; const t = w.reduce((a, b) => a + b, 0); for (const v of w) { c += v / t; o.push(c); } return o; }
+TOP.CUM = cum(TOP.BINW); TOP.CUM_PUMP = cum(TOP.BINW_PUMP); let BOARD_PUMP = false;
+function randX0(rng, pump) { const C = (pump === undefined ? BOARD_PUMP : pump) ? TOP.CUM_PUMP : TOP.CUM; const u = rng(); let i = 0; while (i < C.length - 1 && u > C[i]) i++; return TOP.x0 + (i + rng()) * TOP.BW; }
+function randTop(rng, p, pump) { p[0] = randX0(rng, pump); p[1] = TOP.v0 + rng() * (TOP.v1 - TOP.v0); p[2] = rng() * TOP.w1; return p; }
 // 'point': burst / wheel exit: angle (rad, 0 = right, -PI/2 = up) and speed
 function startState(spec, p, out) {
   if (spec.kind === 'top') { out[0] = p[0]; out[1] = G.START_Y; out[2] = p[1]; out[3] = p[2]; }
@@ -933,6 +962,8 @@ function randPoint(rng, spec, p) {
 
 // ---- bias tables for 'top' starts: start conditions that naturally reach each slot / the gate ----
 let TABLE = null;
+// precomputed natural gate-capture launches for this geometry (soft flap, GATE_VCAP) — avoids a slow fill at startup
+const GATE_SEEDS = [[86.545,-43.286,33.923],[226.112,-34.693,14.754],[221.953,-16.4,23.613],[116.816,-21.555,23.714],[220.658,-10.62,5.62],[228.761,-48.379,36.648],[232.297,-55.076,14.731],[97.845,-5.836,11.879],[94.427,-53.878,43.833],[132.735,-43.353,49.305],[227.832,-41.309,9.692],[90.21,-57.197,20.037],[248.745,-5.259,33.547],[221.159,-11.283,11.126],[228.592,-42.819,10.599],[88.556,-27.502,47.901],[228.549,-48.459,46.211],[116.735,-22.802,20.47],[113.409,-8.55,38.439],[219.388,-5.103,37.696],[120.198,-38.598,42.953],[236.364,-10.222,32.705],[230.28,-48.335,33.534],[128.972,-29.161,47.729],[235.26,-7.003,46.567],[121.774,-45.833,39.574],[246.152,-45.732,42.414],[240.075,-23.895,37.653],[230.281,-53.055,23.139],[91.148,-39.879,48.3],[219.521,-5.617,28.163],[113.944,-10.885,29.284],[237.848,-17.59,36.883],[238.054,-14.857,15.927],[238.303,-17.316,37.229],[223.29,-22.918,47.525],[218.951,-4.095,23.22],[259.848,-52.17,19.149],[226.455,-38.237,46.649],[241.061,-27.819,42.062],[115.03,-21.794,48.426],[220.681,-11.023,10.063],[115.318,-16.31,7.319],[160.325,-26.002,19.659],[241.809,-31.962,36.525],[124.331,-52.911,15.231],[174.434,-2.023,9.869],[113.721,-9.829,38.395],[223.819,-24.949,47.378],[226.232,-35.915,47.339],[227.659,-40.798,33.136],[249.005,-7.567,46.928],[246.557,-46.998,46.918],[242.859,-32.519,20.073],[265.052,-49.132,6.157],[221.409,-43.331,21.923],[157.404,-5.167,18.947],[241.412,-28.173,47.237],[122.342,-4.106,22.581],[227.559,-37.342,2.489]];
 function buildTable(rng, n) {
   const tab = { slot: [], gate: [] }; for (let s = 0; s < 11; s++) tab.slot.push([]);
   const p = [0, 0, 0], st = [0, 0, 0, 0];
@@ -945,6 +976,8 @@ function buildTable(rng, n) {
   }
   // make sure every slot has entries (edge slots): targeted random fill
   for (let s = 0; s < 11; s++) { let guard = 0; while (tab.slot[s].length < 40 && guard++ < 200000) { randTop(rng, p); if (s <= 1) p[0] = TOP.x0 + rng() * 110; if (s >= 9) p[0] = TOP.x1 - rng() * 110; startState({ kind: 'top' }, p, st); const o = sim(st[0], st[1], st[2], st[3], 0, null, null, false); if (o.code === s) tab.slot[s].push(p.slice()); } }
+  if (tab.gate.length < 60 && GATE_SEEDS) for (const q of GATE_SEEDS) { if (tab.gate.length >= 60) break; tab.gate.push(q.slice()); }
+  { let guard = 0; while (tab.gate.length < 20 && guard++ < 60000) { randTop(rng, p); startState({ kind: 'top' }, p, st); const o2 = sim(st[0], st[1], st[2], st[3], 0, { gate: 'open', targetGate: true }, null, false); if (o2.code === -3) tab.gate.push(p.slice()); } }
   TABLE = tab; return tab;
 }
 function gauss(rng) { return (rng() + rng() + rng() - 1.5) * 1.41; }
@@ -1018,6 +1051,7 @@ function correct(rec, slot) {
 // spec: start {kind:'top'} or {kind:'point', x, y, a0,a1,s0,s1}; t0: start time
 // target: {slot:k} | {gate:true} | {pump:true}; env: {gate, pumps}
 function search(rng, spec, t0, target, env, budget, launch, railFn) {
+  BOARD_PUMP = !!(env && env.pumps);
   const T0 = (q) => railFn ? launch + railFn(q[0]) : t0;
   budget = budget || 500;
   const p = [0, 0, 0], st = [0, 0, 0, 0];
@@ -1058,7 +1092,7 @@ function search(rng, spec, t0, target, env, budget, launch, railFn) {
   return { method: 'fail', n, rec: lastRec, out: lastO };
 }
 
-const API = { TOP, G, nails, present, sim, search, buildTable, Rec, slotOf, slotCenter, correct, rowX, get TABLE() { return TABLE; }, set TABLE(t) { TABLE = t; } };
+const API = { TOP, G, randTop, randX0, nails, present, sim, search, buildTable, Rec, slotOf, slotCenter, correct, rowX, get TABLE() { return TABLE; }, set TABLE(t) { TABLE = t; } };
 if (typeof module !== 'undefined' && module.exports) module.exports = API; else root.MFPhys = API;
 })(typeof self !== 'undefined' ? self : this);
 
@@ -1072,7 +1106,9 @@ const EXIT = { x: G.WX, y: G.WY + G.WR + 7 };
 function railTime(x0) { return 0.38 + (G.FW - x0) / 700; } // up the right rail + along the top rail to x0
 
 // candidate pumpkin positions: lattice nails in rows 1..8 away from the wheel and walls
-const PUMP_CAND = G.nails.filter(n => n.row >= 1 && n.row <= 7 && n.x > 20 && n.x < G.FW - 20 && Math.hypot(n.x - G.WX, n.y - G.WY) > G.WR + 26);
+function segD(sg, x, y) { let u = ((x - sg.ax) * sg.dx + (y - sg.ay) * sg.dy) / sg.l2; u = Math.max(0, Math.min(1, u)); return Math.hypot(x - sg.ax - u * sg.dx, y - sg.ay - u * sg.dy); }
+const PUMP_CAND = G.nails.filter(n => n.row >= 1 && n.row <= 7 && n.x > 20 && n.x < G.FW - 20 && Math.hypot(n.x - G.WX, n.y - G.WY) > G.WR + 26
+  && G.SEGS.every(sg => segD(sg, n.x, n.y) > G.PR + sg.r + 2 * G.R + 3)); // never wedge a wisp between a pumpkin and a guide rail
 function pumpLayout(rng, count) {
   for (let k = 0; k < 50; k++) { const o = pumpLayout1(rng, count); if (o.length >= count) return o; }
   return pumpLayout1(rng, count);
@@ -1104,7 +1140,7 @@ function mulberry(seed) { let a = seed >>> 0; return function () { a = (a + 0x6D
 function tryPlan(spec, rng) {
   const n = spec.wisps.length, ps = spec.packSize || n, iv = spec.interval || 0.42;
   const pumps = spec.pumps ? spec.pumps.map(p => Object.assign({}, p, { tb: Infinity, claimed: false })) : null;
-  const env = { gate: spec.gateOpen ? 'open' : 'closed', pumps };
+  const env = { gate: spec.gateOpen ? 'open' : 'closed', gateMode: spec.gateMode || 'bonus', pumps };
   const stats = { main: 0, fallback: 0, corrector: 0, fail: 0, cand: 0 };
   const flights = [];
   const note = (r) => { stats[r.method]++; stats.cand += r.n; if (r.bump || (r.out && r.out.bump)) stats.bump = (stats.bump || 0) + 1; };
@@ -1133,7 +1169,7 @@ function tryPlan(spec, rng) {
         // burst: parent + 2 new wisps fly out of the pumpkin
         const ang = Math.atan2(r.out.y - p.y, r.out.x - p.x);
         const sx = p.x + Math.cos(ang) * (G.PR + G.R + 0.6), sy = p.y + Math.sin(ang) * (G.PR + G.R + 0.6);
-        for (let c = 0; c < 3; c++) children.push({ kind: 'point', x: sx, y: sy, t0: r.out.t + 0.02, a0: ang - 1.45, a1: ang + 1.45, s0: 140, s1: 380, child: true, from: pi });
+        for (let c = 0; c < 3; c++) children.push({ kind: 'point', x: sx, y: sy, t0: r.out.t + 0.02, a0: -Math.PI / 2 - 0.6, a1: -Math.PI / 2 + 0.6, s0: 150, s1: 300, child: true, from: pi }); // burst fountain: thrown upwards
         // shuffle children so the chain is not always the same branch
         for (let i = children.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); const t = children[i]; children[i] = children[j]; children[j] = t; }
       } else { seg.triedBreak = true; finals.push(seg); }
@@ -1208,7 +1244,7 @@ function purePack(spec) {
   const rng = mulberry(spec.presSeed), n = spec.wisps.length, iv = spec.interval || 0.42, flights = [];
   for (let i = 0; i < n; i++) {
     for (let k = 0; k < 50; k++) {
-      const x0 = P.TOP.x0 + rng() * (P.TOP.x1 - P.TOP.x0), vx = P.TOP.v0 + rng() * (P.TOP.v1 - P.TOP.v0), vy = rng() * P.TOP.w1;
+      const x0 = P.randX0(rng), vx = P.TOP.v0 + rng() * (P.TOP.v1 - P.TOP.v0), vy = rng() * P.TOP.w1;
       const t0 = i * iv + railTime(x0); const rec = new P.Rec(t0, x0, G.START_Y); const o = P.sim(x0, G.START_Y, vx, vy, t0, { gate: 'closed' }, rec, false);
       if (o.code >= 0) { const f = mkFlight({ kind: 'top', launch: i * iv, init: true, idx: i }, { rec, method: 'pure' }, i, 'slot'); f.landed = o.code; flights.push(f); break; }
     }
@@ -1647,7 +1683,7 @@ function startBonus() {
 function bonusSpec(k) {
   const pk = bonusRun.b.packs[k], set = bonusRun.set; const seed = (game.presSeed + 7919 * (k + 1)) >>> 0;
   const r = L.rngFrom(seed ^ 0x5bd1e995);
-  return { wisps: pk.wisps, packSize: pk.packSize, B: pk.B, gateOpen: true, pumps: set.includes('pumpkin') ? PL.pumpLayout(r, C.PUMPKINS) : null, interval: PARAM.turbo ? 0.2 : (pk.packSize > 5 ? 0.3 : pk.packSize > 3 ? 0.45 : 0.5), presSeed: seed, W: C.W };
+  return { wisps: pk.wisps, packSize: pk.packSize, B: pk.B, gateOpen: true, gateMode: set.length === 3 ? 'midnight' : 'bonus', pumps: set.includes('pumpkin') ? PL.pumpLayout(r, C.PUMPKINS) : null, interval: PARAM.turbo ? 0.2 : (pk.packSize > 5 ? 0.3 : pk.packSize > 3 ? 0.45 : 0.5), presSeed: seed, W: C.W };
 }
 function prefetch(k) { if (!bonusRun || k >= bonusRun.b.packs.length || bonusRun.plans[k]) return; const spec = bonusSpec(k); bonusRun.plans[k] = { spec, pr: plan(spec) }; }
 function nextBonusPack() {
