@@ -1,0 +1,1892 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#120a2a">
+<title>Midnight Fair — pachinko-slot prototype</title>
+<link rel="preload" href="assets/bangers.woff2" as="font" type="font/woff2" crossorigin>
+<style>
+@font-face { font-family: 'Bangers'; src: url(assets/bangers.woff2) format('woff2'); font-display: block; }
+@font-face { font-family: 'Creepster'; src: url(assets/creepster.woff2) format('woff2'); font-display: block; }
+html, body { margin: 0; height: 100%; background: #0d0720; overflow: hidden; touch-action: manipulation; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+body { font-family: 'Bangers', system-ui, sans-serif; color: #f4e9ff; }
+#top { position: fixed; left: 0; right: 0; top: 0; height: 30px; padding-top: env(safe-area-inset-top); display: flex; justify-content: center; gap: 0; z-index: 3;
+  background: linear-gradient(#1d0f3f, #120830); border-bottom: 1px solid #ff8a1f55; box-shadow: 0 2px 10px #000a; letter-spacing: 0.06em; }
+#top .c { flex: 1; max-width: 200px; display: flex; align-items: baseline; justify-content: center; gap: 7px; line-height: 30px; font-size: 13px; color: #b9a6e6; white-space: nowrap; }
+#top .c b { font-weight: normal; font-size: 19px; color: #ffe2a8; text-shadow: 0 0 6px #ff8a1f88; }
+#top #win b { color: #b8ff7a; text-shadow: 0 0 8px #6dff2a88; }
+#cv, #cvbg { position: fixed; left: 0; top: calc(30px + env(safe-area-inset-top)); width: 100%; height: calc(100% - 30px - env(safe-area-inset-top)); display: block; }
+#dbg { position: fixed; left: 4px; top: 36px; z-index: 4; font: 10px/1.3 ui-monospace, monospace; color: #d9ffb0; background: #000a; padding: 4px 6px; border-radius: 4px; pointer-events: none; white-space: pre; display: none; }
+</style>
+</head>
+<body data-mode="loading">
+<div id="top"><div class="c">BALANCE <b id="bal">0</b></div><div class="c">BET <b id="bet">10</b></div><div class="c" id="win">WIN <b id="winv">0</b></div></div>
+<canvas id="cvbg"></canvas>
+<canvas id="cv"></canvas>
+<div id="dbg"></div>
+<script type="text/plain" id="wsrc">// Midnight Fair — game math / outcome logic (pure, shared by UI, worker and math sim)
+(function (root) {
+'use strict';
+function rngFrom(seed) { // mulberry32
+  let a = seed >>> 0;
+  const f = function () { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  f.state = () => a; f.setState = (s) => { a = s >>> 0; }; return f;
+}
+function pickW(rng, w, tot) { let r = rng() * tot; for (let i = 0; i < w.length; i++) { r -= w[i]; if (r < 0) return i; } return w.length - 1; }
+const sum = (a) => a.reduce((x, y) => x + y, 0);
+
+// ---- data (slot types/prices are data; board geometry is independent) ----
+const CFG = {
+  BET: 10, N: 10,                 // bet buys a pack of 10 wisps; wisp price = BET/N
+  SLOTS: [ // values in wisp prices
+    { t: 'prize', v: 20 }, { t: 'booth', b: 'train', v: 1 }, { t: 'prize', v: 3 }, { t: 'prize', v: 1 }, { t: 'empty', v: 0 },
+    { t: 'booth', b: 'pumpkin', v: 1 },
+    { t: 'empty', v: 0 }, { t: 'prize', v: 1 }, { t: 'prize', v: 3 }, { t: 'booth', b: 'crypt', v: 1 }, { t: 'prize', v: 20 }],
+  // RNG weights per slot (binomial-like: centre frequent, edges rare). Sum = 10000.
+  W: [25, 250, 260, 480, 3175, 1400, 3175, 480, 260, 250, 25],
+  // slot weights for a wisp dropping out of the Ferris wheel (it exits low, in the centre)
+  WEXIT: [0, 0, 400, 1500, 2600, 1000, 2600, 1500, 400, 0, 0],
+  // trigger: per game. combos: T, C, P, TC, TP, CP, TCP(=Midnight)
+  TRIG_P: 1 / 88,
+  COMBOS: [['train'], ['crypt'], ['pumpkin'], ['train', 'crypt'], ['train', 'pumpkin'], ['crypt', 'pumpkin'], ['train', 'crypt', 'pumpkin']],
+  COMBO_W: [340, 300, 300, 22, 22, 22, 4],
+  // Ghost Train (Fever)
+  TRAIN_PACKS: 8, TRAIN_PACK: 10, TRAIN_RETRIG: 2, TRAIN_MAXPACKS: 20, DOOR_CAND: [3, 4, 6, 7], DOORS_N: 2, DOOR_V: 3,
+  // Prize Crypt (Hold & Drop)
+  CRYPT_START: 3, CRYPT_RESPINS: 3, CRYPT_PACK: 3,
+  COIN_V: [3, 5, 10, 15, 20, 30, 60, 150],   // in wisp prices (10 = 1x bet)
+  COIN_W: [300, 300, 170, 110, 70, 35, 12, 3],
+  FULL_MULT: 2,
+  // Pumpkin Blast (Multiball)
+  PUMP_PACKS: 5, PUMP_PACK: 5, PUMPKINS: 12, CHAIN_CAP: 10, PUMP_Q: 0.22, MAX_ON_BOARD: 30, BURST_V: 12,
+  // Ferris wheel / jackpots (standalone, fixed, in x bet)
+  GATE_P: 0.0015, GATE_P_MIDNIGHT: 0.012,   // per wisp in a bonus (max one wheel ride per pack)
+  CABINS: ['grand', 'mini', 'minor', 'mini', 'major', 'mini', 'minor', 'mini'], // cabin 0 = V-cabin
+  JP_LEVELS: ['mini', 'minor', 'major', 'grand'], JP_X: { mini: 10, minor: 25, major: 100, grand: 1000 },
+  JP_W: { mini: 6400, minor: 2700, major: 820, grand: 80 },
+};
+CFG.WT = sum(CFG.W); CFG.WEXT = sum(CFG.WEXIT); CFG.COMBO_WT = sum(CFG.COMBO_W); CFG.COIN_WT = sum(CFG.COIN_W);
+const BOOTH_SLOT = { train: 1, pumpkin: 5, crypt: 9 };
+
+function comboName(set) { if (set.length === 3) return 'midnight'; return set.join('+'); }
+function parseCombo(s) { if (!s) return null; if (s === 'midnight') return ['train', 'crypt', 'pumpkin']; const p = s.split(/[+ ,]/).filter(Boolean); const ok = p.every(x => BOOTH_SLOT[x] !== undefined); return ok && p.length ? ['train', 'crypt', 'pumpkin'].filter(x => p.includes(x)) : null; }
+
+// ---- base game: one bet = one pack of N wisps ----
+function playBase(rng, opt) {
+  opt = opt || {};
+  const N = CFG.N, slots = new Array(N);
+  for (let i = 0; i < N; i++) slots[i] = pickW(rng, CFG.W, CFG.WT);
+  let trig = null;
+  const tr = rng();
+  if (opt.forceBonus) trig = opt.forceBonus.slice();
+  else if (tr < CFG.TRIG_P) trig = CFG.COMBOS[pickW(rng, CFG.COMBO_W, CFG.COMBO_WT)].slice();
+  if (trig) { // presentation: the last booth wisp(s) "fill" the sign(s): last k wisps go to the triggered booths
+    for (let j = 0; j < trig.length; j++) slots[N - trig.length + j] = BOOTH_SLOT[trig[j]];
+  }
+  let win = 0; for (const s of slots) win += CFG.SLOTS[s].v;
+  return { slots, winW: win, trig }; // winW in wisp prices
+}
+
+function drawCoin(rng) { return CFG.COIN_V[pickW(rng, CFG.COIN_W, CFG.COIN_WT)]; }
+function drawJP(rng, force) {
+  if (force) return force;
+  const w = CFG.JP_W; let r = rng() * (w.mini + w.minor + w.major + w.grand);
+  for (const k of CFG.JP_LEVELS) { r -= w[k]; if (r < 0) return k; } return 'mini';
+}
+// Multiball chain length (number of pumpkin breaks) via a capped branching process.
+function drawChain(rng, packSize) {
+  const cap = Math.min(CFG.CHAIN_CAP, Math.floor((CFG.MAX_ON_BOARD - packSize) / 2));
+  let open = packSize, B = 0;
+  while (open > 0 && B < cap) { open--; if (rng() < CFG.PUMP_Q) { B++; open += 3; } }
+  return B;
+}
+
+// ---- bonus: any combination of train / crypt / pumpkin. Returns full script (all packs). ----
+function playBonus(rng, set, opt) {
+  opt = opt || {};
+  const T = set.includes('train'), C = set.includes('crypt'), P = set.includes('pumpkin'), M = T && C && P;
+  const packSize = T ? CFG.TRAIN_PACK : P ? CFG.PUMP_PACK : CFG.CRYPT_PACK;
+  const slotPay = T || P; // pure crypt: wisps only place/add coins
+  let trainLeft = T ? CFG.TRAIN_PACKS : 0, pumpLeft = P ? CFG.PUMP_PACKS : 0, respins = C ? CFG.CRYPT_RESPINS : 0;
+  let trainTotal = trainLeft, cryptDone = !C;
+  const doors = [], open = new Set();
+  if (T) { const c = CFG.DOOR_CAND.slice(); for (let i = 0; i < CFG.DOORS_N; i++) doors.push(c.splice(Math.floor(rng() * c.length), 1)[0]); doors.sort((a, b) => a - b); }
+  const coins = new Array(11).fill(0);
+  const startCoins = [];
+  if (C) { const idx = [...Array(11).keys()]; for (let i = 0; i < CFG.CRYPT_START; i++) { const k = Math.floor(rng() * idx.length); const s = idx.splice(k, 1)[0]; const v = drawCoin(rng); coins[s] = v; startCoins.push({ slot: s, v }); } }
+  const gp = M ? CFG.GATE_P_MIDNIGHT : CFG.GATE_P;
+  const packs = []; let payW = 0, jpX = 0; const jps = []; let fullCrypt = false; let forcedJP = opt.forceJackpot || null;
+  let guard = 0;
+  while ((trainLeft > 0 || pumpLeft > 0 || (!cryptDone && respins > 0)) && guard++ < 200) {
+    const B = P ? (opt.forceChain ? Math.min(+opt.forceChain, CFG.CHAIN_CAP, Math.floor((CFG.MAX_ON_BOARD - packSize) / 2)) : drawChain(rng, packSize)) : 0;
+    const n = packSize + 2 * B;
+    const wisps = [];
+    // gate (wheel) entry: per wisp chance, max one per pack
+    let gateIdx = -1;
+    let pg = 1 - Math.pow(1 - gp, n);
+    if (forcedJP && packs.length === 0) pg = 1;
+    if (rng() < pg) gateIdx = Math.floor(rng() * n);
+    let newCoin = false, trainAdd = 0, packPay = B * CFG.BURST_V;
+    for (let i = 0; i < n; i++) {
+      const w = { slot: 0, pay: 0 };
+      if (i === gateIdx) { w.gate = drawJP(rng, forcedJP); forcedJP = null; jpX += CFG.JP_X[w.gate]; jps.push(w.gate); w.slot = pickW(rng, CFG.WEXIT, CFG.WEXT); }
+      else w.slot = pickW(rng, CFG.W, CFG.WT);
+      const sd = CFG.SLOTS[w.slot];
+      if (slotPay) {
+        if (T && doors.includes(w.slot)) { if (!open.has(w.slot)) { open.add(w.slot); w.opens = true; } w.pay = CFG.DOOR_V; }
+        else w.pay = sd.v;
+        if (T && sd.b === 'train' && trainTotal < CFG.TRAIN_MAXPACKS) { const a = Math.min(CFG.TRAIN_RETRIG, CFG.TRAIN_MAXPACKS - trainTotal); trainAdd += a; trainTotal += a; w.retrig = a; }
+      }
+      if (!cryptDone) { const v = drawCoin(rng); w.coin = v; if (coins[w.slot] === 0) newCoin = true; coins[w.slot] += v; }
+      packPay += w.pay; wisps.push(w);
+    }
+    const pack = { n, B, wisps, packSize };
+    if (T) { trainLeft = trainLeft - 1 + trainAdd; }
+    if (P) pumpLeft--;
+    if (!cryptDone) {
+      respins = newCoin ? CFG.CRYPT_RESPINS : respins - 1;
+      if (coins.every(c => c > 0)) { // FULL CRYPT: all coins x2 + guaranteed wheel ride
+        fullCrypt = true; cryptDone = true; for (let k = 0; k < 11; k++) coins[k] *= CFG.FULL_MULT;
+        const jp = drawJP(rng, forcedJP); forcedJP = null; jpX += CFG.JP_X[jp]; jps.push(jp);
+        const ws = pickW(rng, CFG.WEXIT, CFG.WEXT); const sd = CFG.SLOTS[ws];
+        let pay = 0; if (slotPay) pay = (T && open.has(ws)) ? CFG.DOOR_V : sd.v;
+        pack.fullWisp = { slot: ws, gate: jp, pay, full: true }; packPay += pay;
+      } else if (respins <= 0) cryptDone = true;
+    }
+    pack.respins = respins; pack.trainLeft = trainLeft; pack.pumpLeft = pumpLeft; pack.coins = coins.slice(); pack.open = [...open]; pack.packPay = packPay;
+    payW += packPay; packs.push(pack);
+  }
+  const coinW = sum(coins);
+  return { set, packs, startCoins, doors, payW, coinW, jpX, jps, fullCrypt, totalW: payW + coinW + jpX * CFG.N };
+}
+
+// ---- one full game (base + possible bonus), for the math sim ----
+function playGame(rng, opt) {
+  const b = playBase(rng, opt);
+  let bonus = null; if (b.trig) bonus = playBonus(rng, b.trig, opt);
+  return { base: b, bonus, totalW: b.winW + (bonus ? bonus.totalW : 0) };
+}
+const API = { CFG, BOOTH_SLOT, rngFrom, pickW, playBase, playBonus, playGame, drawChain, drawJP, drawCoin, comboName, parseCombo };
+if (typeof module !== 'undefined' && module.exports) module.exports = API; else root.MFLogic = API;
+})(typeof self !== 'undefined' ? self : this);
+
+// Midnight Fair — steered-wisp technology: own 2D sim (circles vs static circles & walls, fixed step),
+// trajectory search (main path), impact steering fallback (±15°), final corrector, anti-stuck.
+(function (root) {
+'use strict';
+const G = {
+  FW: 330, R: 5.5, NR: 3, PR: 8.5, ROWS: 10, ROW0: 64, DY: 30, DX: 30,
+  WX: 165, WY: 196, WR: 52, GATE_Y: 139, GATE_R: 7,
+  DIV_TOP: 360, END_Y: 380, FLOOR: 408, START_Y: 14,
+  GRAV: 980, DT: 1 / 240, E_NAIL: 0.35, E_WALL: 0.5, E_WHEEL: 0.5, E_PUMP: 0.6, FRIC: 0.75, VMAX: 720,
+  TMAX: 9, REC_EVERY: 4, DRAGX: 1 - 1.5 / 240, GFRIC: 0.96, // record at 60 Hz
+};
+G.SLOTS = 11; G.SW = G.FW / G.SLOTS;
+// side guide rails (funnel wisps toward the centre; a narrow channel along each wall leads to the x20 pockets)
+G.SEGS = [];
+function addGuides(list) { for (const g of list) { G.SEGS.push({ ax: g[0], ay: g[1], bx: g[2], by: g[3], r: 2 }); G.SEGS.push({ ax: G.FW - g[0], ay: g[1], bx: G.FW - g[2], by: g[3], r: 2 }); } }
+addGuides(globalThis.MF_GUIDES || [[16, 258, 40, 282], [80, 246, 114, 270]]);
+for (const sg of G.SEGS) { sg.minY = Math.min(sg.ay, sg.by) - 12; sg.maxY = Math.max(sg.ay, sg.by) + 12; sg.dx = sg.bx - sg.ax; sg.dy = sg.by - sg.ay; sg.l2 = sg.dx * sg.dx + sg.dy * sg.dy; }
+function segDist(sg, x, y) { let u = ((x - sg.ax) * sg.dx + (y - sg.ay) * sg.dy) / sg.l2; u = u < 0 ? 0 : u > 1 ? 1 : u; return [sg.ax + u * sg.dx, sg.ay + u * sg.dy]; }
+// nail lattice: present[row][k]; row even: x=15+30k (k 0..10); odd: x=30k (k 1..10)
+const nails = []; // {x,y,row,k,id}
+const present = [];
+function rowX(row, k) { return (row % 2 === 0) ? 15 + 30 * k : (k === 0 ? 1 : k === 11 ? 329 : 30 * k); }
+for (let r = 0; r < G.ROWS; r++) {
+  present.push(new Int16Array(12).fill(-1));
+  const y = G.ROW0 + r * G.DY;
+  const k0 = 0, k1 = (r % 2 === 0) ? 10 : 11; // odd rows get wall kicker nails at x=7 / x=323
+  for (let k = k0; k <= k1; k++) {
+    const x = rowX(r, k);
+    const dw = Math.hypot(x - G.WX, y - G.WY), dg = Math.hypot(x - G.WX, y - G.GATE_Y);
+    if (dw < G.WR + G.NR + 2 * G.R + 1.5) continue;
+    if (dg < 22) continue;
+    let nearSeg = false; for (const sg of G.SEGS) { const q = segDist(sg, x, y); if (Math.hypot(x - q[0], y - q[1]) < sg.r + G.NR + 2 * G.R - 1) nearSeg = true; }
+    if (nearSeg) continue;
+    present[r][k] = nails.length; nails.push({ x, y, row: r, k, id: nails.length });
+  }
+}
+G.nails = nails;
+
+function slotOf(x) { return Math.max(0, Math.min(10, Math.floor(x / G.SW))); }
+function slotCenter(s) { return (s + 0.5) * G.SW; }
+
+// ---- core simulation ----
+// env: { gate: 'closed'|'open', pumps: [{x,y,tb,claimed}] (tb = break time, Infinity if standing), targetPump: bool }
+// returns code: >=0 slot | -1 timeout/stuck | -2 forbidden (gate or pumpkin contact) | -3 gate captured | -4 pumpkin target hit
+const OUT = { code: 0, t: 0, x: 0, y: 0, vx: 0, vy: 0, pump: -1, nImp: 0 };
+function sim(x, y, vx, vy, t0, env, rec, stopAtImpact) {
+  const R = G.R, dt = G.DT, rr = R + G.NR, rr2 = rr * rr, pr = R + G.PR, pr2 = pr * pr;
+  const gateOpen = env && env.gate === 'open', pumps = env && env.pumps, wantPump = env && env.targetPump, wantGate = env && env.targetGate;
+  let t = t0, step = 0, sx = x, sy = y, stuckT = t0 + 0.75, nImp = 0;
+  const wr = G.WR + R, wr2 = wr * wr, gr = G.GATE_R + R, gr2 = gr * gr;
+  while (true) {
+    vy += G.GRAV * dt; vx *= G.DRAGX; x += vx * dt; y += vy * dt; t += dt; step++;
+    let imp = 0, nx = 0, ny = 0, impKind = 0, impId = -1;
+    // walls
+    if (x < R) { x = R; if (vx < 0) { vx = -vx * G.E_WALL; vy *= G.FRIC; if (vx > 30) { imp = 1; impKind = 2; nx = 1; ny = 0; } } }
+    else if (x > G.FW - R) { x = G.FW - R; if (vx > 0) { vx = -vx * G.E_WALL; vy *= G.FRIC; if (vx < -30) { imp = 1; impKind = 2; nx = -1; ny = 0; } } }
+    if (y < R) { y = R; if (vy < 0) vy = -vy * G.E_WALL; }
+    // nails
+    const rf = (y - G.ROW0) / G.DY, row = Math.round(rf);
+    if (row >= 0 && row < G.ROWS) {
+      const ny0 = G.ROW0 + row * G.DY;
+      if (Math.abs(y - ny0) < rr) {
+        const k = (row % 2 === 0) ? Math.round((x - 15) / 30) : (x < 18 ? 0 : x > 312 ? 11 : Math.round(x / 30));
+        if (k >= 0 && k <= 11) {
+          const id = present[row][k];
+          if (id >= 0) {
+            const n = nails[id], dx = x - n.x, dy = y - n.y, d2 = dx * dx + dy * dy;
+            if (d2 < rr2 && d2 > 1e-9) {
+              const d = Math.sqrt(d2), ux = dx / d, uy = dy / d, pen = rr - d; x += ux * pen; y += uy * pen;
+              const vn = vx * ux + vy * uy;
+              if (vn < 0) { const tx = vx - vn * ux, ty = vy - vn * uy; if (vn < -25) { vx = tx * G.FRIC - G.E_NAIL * vn * ux; vy = ty * G.FRIC - G.E_NAIL * vn * uy; } else { vx = tx; vy = ty; } if (vn < -35) { imp = 1; impKind = 1; impId = id; nx = ux; ny = uy; } }
+            }
+          }
+        }
+      }
+    }
+    // guide rails
+    for (let si = 0; si < G.SEGS.length; si++) {
+      const sg = G.SEGS[si]; if (y < sg.minY || y > sg.maxY) continue;
+      let u = ((x - sg.ax) * sg.dx + (y - sg.ay) * sg.dy) / sg.l2; u = u < 0 ? 0 : u > 1 ? 1 : u;
+      const qx = sg.ax + u * sg.dx, qy = sg.ay + u * sg.dy, dx = x - qx, dy = y - qy, d2 = dx * dx + dy * dy, q = R + sg.r;
+      if (d2 < q * q && d2 > 1e-9) { const d = Math.sqrt(d2), ux = dx / d, uy = dy / d; x += ux * (q - d); y += uy * (q - d);
+        const vn = vx * ux + vy * uy; if (vn < 0) { const tx = vx - vn * ux, ty = vy - vn * uy; vx = tx * G.GFRIC - 0.3 * vn * ux; vy = ty * G.GFRIC - 0.3 * vn * uy; if (vn < -60) { imp = 1; impKind = 2; nx = ux; ny = uy; } } }
+    }
+    // pumpkins
+    if (pumps) {
+      for (let i = 0; i < pumps.length; i++) {
+        const p = pumps[i]; if (t >= p.tb) continue;
+        const dx = x - p.x, dy = y - p.y, d2 = dx * dx + dy * dy;
+        if (d2 < pr2) {
+          if (env.pumpSolid) { const d = Math.sqrt(d2) || 1e-6, ux = dx / d, uy = dy / d; x += ux * (pr - d); y += uy * (pr - d); const vn = vx * ux + vy * uy; if (vn < 0) { vx -= (1 + G.E_PUMP) * vn * ux; vy -= (1 + G.E_PUMP) * vn * uy; } continue; }
+          if (wantPump && !p.claimed) { OUT.code = -4; OUT.pump = i; OUT.t = t; OUT.x = x; OUT.y = y; OUT.vx = vx; OUT.vy = vy; OUT.nImp = nImp; if (rec) rec.end(t, x, y); return OUT; }
+          OUT.code = -2; OUT.t = t; OUT.x = x; OUT.y = y; if (rec) rec.end(t, x, y); return OUT;
+        }
+      }
+    }
+    // wheel + gate
+    { const dx = x - G.WX, dy = y - G.WY, d2 = dx * dx + dy * dy;
+      if (d2 < wr2 + 400) {
+        const gdx = x - G.WX, gdy = y - G.GATE_Y, g2 = gdx * gdx + gdy * gdy;
+        if (g2 < gr2) {
+          if (gateOpen) {
+            if (wantGate) { OUT.code = -3; OUT.t = t; OUT.x = x; OUT.y = y; OUT.vx = vx; OUT.vy = vy; OUT.nImp = nImp; if (rec) rec.end(t, x, y); return OUT; }
+            OUT.code = -2; OUT.t = t; OUT.x = x; OUT.y = y; if (rec) rec.end(t, x, y); return OUT;
+          }
+          const d = Math.sqrt(g2) || 1e-6, ux = gdx / d, uy = gdy / d, pen = gr - d; x += ux * pen; y += uy * pen;
+          const vn = vx * ux + vy * uy; if (vn < 0) { const tx = vx - vn * ux, ty = vy - vn * uy; const fr = vn < -25 ? G.FRIC : 1; vx = tx * fr - G.E_WHEEL * vn * ux; vy = ty * fr - G.E_WHEEL * vn * uy; if (vn < -35) { imp = 1; impKind = 3; nx = ux; ny = uy; } }
+        } else if (d2 < wr2) {
+          const d = Math.sqrt(d2), ux = dx / d, uy = dy / d, pen = wr - d; x += ux * pen; y += uy * pen;
+          const vn = vx * ux + vy * uy; if (vn < 0) { const tx = vx - vn * ux, ty = vy - vn * uy; const fr = vn < -25 ? G.FRIC : 1; vx = tx * fr - G.E_WHEEL * vn * ux; vy = ty * fr - G.E_WHEEL * vn * uy; if (vn < -35) { imp = 1; impKind = 3; nx = ux; ny = uy; } }
+        }
+      }
+    }
+    // slot dividers
+    if (y > G.DIV_TOP - R) {
+      const kd = Math.round(x / G.SW);
+      if (kd >= 1 && kd <= 10) {
+        const xd = kd * G.SW;
+        if (y < G.DIV_TOP) { const dx = x - xd, dy = y - G.DIV_TOP, d2 = dx * dx + dy * dy, q = R + 1.5;
+          if (d2 < q * q) { const d = Math.sqrt(d2) || 1e-6, ux = dx / d, uy = dy / d; x += ux * (q - d); y += uy * (q - d); const vn = vx * ux + vy * uy; if (vn < 0) { vx -= 1.4 * vn * ux; vy -= 1.4 * vn * uy; } } }
+        else if (Math.abs(x - xd) < R + 1.5) { const s = x > xd ? 1 : -1; x = xd + s * (R + 1.5); if (vx * s < 0) vx = -vx * 0.3; }
+      }
+    }
+    // speed cap
+    const v2 = vx * vx + vy * vy; if (v2 > G.VMAX * G.VMAX) { const f = G.VMAX / Math.sqrt(v2); vx *= f; vy *= f; }
+    if (imp) nImp++;
+    if (rec) { if (step % G.REC_EVERY === 0) rec.push(t, x, y); if (imp) rec.imp(t, x, y, impKind, impId); }
+    if (y >= G.END_Y) { OUT.code = slotOf(x); OUT.t = t; OUT.x = x; OUT.y = y; OUT.vx = vx; OUT.vy = vy; OUT.nImp = nImp; if (rec) rec.end(t, x, y); return OUT; }
+    if (imp && stopAtImpact && impKind === 1) { OUT.code = -9; OUT.t = t; OUT.x = x; OUT.y = y; OUT.vx = vx; OUT.vy = vy; OUT.nx = nx; OUT.ny = ny; OUT.nImp = nImp; return OUT; }
+    if (t > stuckT) { // anti-stuck: must move at least 3 units per 0.75 s
+      if (Math.abs(x - sx) + Math.abs(y - sy) < 3) { OUT.code = -1; OUT.t = t; if (rec) rec.end(t, x, y); return OUT; }
+      sx = x; sy = y; stuckT = t + 0.75;
+    }
+    if (t - t0 > G.TMAX) { OUT.code = -1; OUT.t = t; if (rec) rec.end(t, x, y); return OUT; }
+  }
+}
+
+function Rec(t0, x, y) { this.t0 = t0; this.pts = [t0, x, y]; this.imps = []; }
+Rec.prototype.push = function (t, x, y) { this.pts.push(t, x, y); };
+Rec.prototype.imp = function (t, x, y, k, id) { this.imps.push(t, x, y, k, id); };
+Rec.prototype.end = function (t, x, y) { const n = this.pts.length; if (this.pts[n - 3] < t) this.pts.push(t, x, y); };
+
+// ---- start conditions ----
+// 'top': wisp leaves the top rail at (x0, START_Y) with velocity (vx0, vy0) (it travelled right->left along the rail)
+const TOP = { x0: 120, x1: 210, v0: -60, v1: 0, w1: 50 };
+function randTop(rng, p) { p[0] = TOP.x0 + rng() * (TOP.x1 - TOP.x0); p[1] = TOP.v0 + rng() * (TOP.v1 - TOP.v0); p[2] = rng() * TOP.w1; return p; }
+// 'point': burst / wheel exit: angle (rad, 0 = right, -PI/2 = up) and speed
+function startState(spec, p, out) {
+  if (spec.kind === 'top') { out[0] = p[0]; out[1] = G.START_Y; out[2] = p[1]; out[3] = p[2]; }
+  else { out[0] = spec.x; out[1] = spec.y; out[2] = Math.cos(p[0]) * p[1]; out[3] = Math.sin(p[0]) * p[1]; }
+  return out;
+}
+function randPoint(rng, spec, p) {
+  const a = spec.a0 + rng() * (spec.a1 - spec.a0), s = spec.s0 + rng() * (spec.s1 - spec.s0); p[0] = a; p[1] = s; return p;
+}
+
+// ---- bias tables for 'top' starts: start conditions that naturally reach each slot / the gate ----
+let TABLE = null;
+function buildTable(rng, n) {
+  const tab = { slot: [], gate: [] }; for (let s = 0; s < 11; s++) tab.slot.push([]);
+  const p = [0, 0, 0], st = [0, 0, 0, 0];
+  for (let i = 0; i < n; i++) {
+    randTop(rng, p); startState({ kind: 'top' }, p, st);
+    const o = sim(st[0], st[1], st[2], st[3], 0, null, null, false);
+    if (o.code >= 0 && tab.slot[o.code].length < 400) tab.slot[o.code].push(p.slice());
+    const o2 = sim(st[0], st[1], st[2], st[3], 0, { gate: 'open', targetGate: true }, null, false);
+    if (o2.code === -3 && tab.gate.length < 400) tab.gate.push(p.slice());
+  }
+  // make sure every slot has entries (edge slots): targeted random fill
+  for (let s = 0; s < 11; s++) { let guard = 0; while (tab.slot[s].length < 40 && guard++ < 200000) { randTop(rng, p); if (s <= 1) p[0] = TOP.x0 + rng() * 110; if (s >= 9) p[0] = TOP.x1 - rng() * 110; startState({ kind: 'top' }, p, st); const o = sim(st[0], st[1], st[2], st[3], 0, null, null, false); if (o.code === s) tab.slot[s].push(p.slice()); } }
+  TABLE = tab; return tab;
+}
+function gauss(rng) { return (rng() + rng() + rng() - 1.5) * 1.41; }
+function proposeTop(rng, target, p) {
+  const list = target.gate ? TABLE.gate : (target.slot !== undefined ? TABLE.slot[target.slot] : null);
+  if (list && list.length && rng() < 0.75) {
+    const b = list[Math.floor(rng() * list.length)], sc = 0.4 + rng() * 1.6;
+    p[0] = Math.max(TOP.x0, Math.min(TOP.x1, b[0] + gauss(rng) * 5 * sc)); p[1] = Math.max(TOP.v0, Math.min(TOP.v1, b[1] + gauss(rng) * 14 * sc)); p[2] = Math.max(0, Math.min(TOP.w1, b[2] + gauss(rng) * 7 * sc));
+    return p;
+  }
+  return randTop(rng, p);
+}
+
+// outcome check for a target
+function hit(o, target) {
+  if (target.gate) return o.code === -3;
+  if (target.pump) return o.code === -4;
+  return o.code === target.slot;
+}
+function miss(o, target) { // distance metric for steering (smaller = better)
+  if (target.gate) return o.code === -3 ? 0 : (o.code >= 0 ? 1000 + Math.abs(o.x - G.WX) : 1e6);
+  if (target.pump) return o.code === -4 ? 0 : (o.code >= 0 ? 1000 : 1e6);
+  if (o.code >= 0) return Math.abs(o.x - slotCenter(target.slot));
+  return 1e6;
+}
+
+// ---- impact steering fallback: at each nail impact rotate the natural bounce by at most ±15°,
+// keeping |v|; choose the deviation by short look-ahead; pure ballistics between impacts. ----
+const ALPHAS = [0, 5, -5, 10, -10, 15, -15].map(a => a * Math.PI / 180);
+function steer(st, t0, env, target, rec) {
+  let x = st[0], y = st[1], vx = st[2], vy = st[3], t = t0, steps = 0, used = 0;
+  const envL = Object.assign({}, env, { targetPump: !!target.pump, targetGate: !!target.gate });
+  for (let iter = 0; iter < 60; iter++) {
+    const o = sim(x, y, vx, vy, t, envL, rec, true);
+    if (o.code !== -9) return { o: copyOut(o), used };
+    x = o.x; y = o.y; t = o.t; const sp = Math.hypot(o.vx, o.vy), nx = o.nx, ny = o.ny;
+    let best = null, bestM = Infinity, bestA = 0;
+    for (const a of ALPHAS) {
+      const c = Math.cos(a), s = Math.sin(a); const rvx = o.vx * c - o.vy * s, rvy = o.vx * s + o.vy * c;
+      if ((rvx * nx + rvy * ny) < 0.2 * sp) continue; // stay inside the natural cone (must leave the nail)
+      const o2 = sim(x, y, rvx, rvy, t, envL, null, false); steps++;
+      const m = miss(o2, target);
+      if (m < bestM - 1e-9 || (hit(o2, target) && !best)) { bestM = m; best = [rvx, rvy]; bestA = a; }
+      if (hit(o2, target)) { best = [rvx, rvy]; bestA = a; bestM = -1; break; }
+    }
+    if (!best) best = [o.vx, o.vy];
+    if (bestA !== 0) used++;
+    vx = best[0]; vy = best[1];
+    if (bestM === -1) { const o3 = sim(x, y, vx, vy, t, envL, rec, false); return { o: copyOut(o3), used }; }
+  }
+  const o4 = sim(x, y, vx, vy, t, envL, rec, false); return { o: copyOut(o4), used };
+}
+function copyOut(o) { return { code: o.code, t: o.t, x: o.x, y: o.y, vx: o.vx, vy: o.vy, pump: o.pump, nImp: o.nImp }; }
+
+// final corrector (last resort, smooth lateral blend over the last rows into the decided slot)
+function correct(rec, slot) {
+  const P = rec.pts, n = P.length / 3; const xc = slotCenter(slot);
+  let iA = -1, iB = n - 1;
+  for (let i = 0; i < n; i++) { const y = P[i * 3 + 2]; if (iA < 0 && y > 250) iA = i; if (y > G.DIV_TOP - 8) { iB = i; break; } }
+  if (iA < 0) iA = Math.max(0, n - 30);
+  if (iB <= iA) iB = Math.min(n - 1, iA + 10);
+  const dxEnd = xc - P[iB * 3 + 1];
+  for (let i = iA; i < n; i++) {
+    let u = (i - iA) / Math.max(1, iB - iA); if (u > 1) u = 1; const s = u * u * (3 - 2 * u);
+    if (i <= iB) P[i * 3 + 1] += dxEnd * s; else { const x = P[i * 3 + 1] + dxEnd; P[i * 3 + 1] = xc + (x - xc) * 0.2; }
+  }
+  P[P.length - 2] = xc;
+}
+
+// ---- search one flight: main path (candidates) -> fallback steering -> corrector ----
+// spec: start {kind:'top'} or {kind:'point', x, y, a0,a1,s0,s1}; t0: start time
+// target: {slot:k} | {gate:true} | {pump:true}; env: {gate, pumps}
+function search(rng, spec, t0, target, env, budget, launch, railFn) {
+  const T0 = (q) => railFn ? launch + railFn(q[0]) : t0;
+  budget = budget || 500;
+  const p = [0, 0, 0], st = [0, 0, 0, 0];
+  const envL = Object.assign({}, env || {}, { targetPump: !!target.pump, targetGate: !!target.gate });
+  let best = null, bestM = Infinity, n = 0;
+  for (; n < budget; n++) {
+    if (spec.kind === 'top') proposeTop(rng, target, p); else randPoint(rng, spec, p);
+    startState(spec, p, st); const ts = T0(p);
+    const o = sim(st[0], st[1], st[2], st[3], ts, envL, null, false);
+    if (hit(o, target)) {
+      const rec = new Rec(ts, st[0], st[1]); const o2 = sim(st[0], st[1], st[2], st[3], ts, envL, rec, false);
+      return { method: 'main', n: n + 1, params: p.slice(), rec, out: copyOut(o2) };
+    }
+    const m = miss(o, target); if (m < bestM) { bestM = m; best = p.slice(); }
+  }
+  // fallback: impact steering from the best candidates (try a few)
+  const tries = [best];
+  for (let k = 0; k < 6; k++) { const q = [0, 0, 0]; if (spec.kind === 'top') proposeTop(rng, target, q); else randPoint(rng, spec, q); tries.push(q); }
+  let lastRec = null, lastO = null;
+  for (const q of tries) {
+    if (!q) continue;
+    startState(spec, q, st); const ts = T0(q); const rec = new Rec(ts, st[0], st[1]);
+    const r = steer(st, ts, env || {}, target, rec);
+    if (hit(r.o, target)) return { method: 'fallback', n, params: q.slice(), rec, out: r.o, steered: r.used };
+    if (!lastO || (r.o.code >= 0 && lastO.code < 0)) { lastRec = rec; lastO = r.o; }
+  }
+  if (target.slot !== undefined && (!lastO || lastO.code < 0)) { // last resort: pumpkins act as solid bumpers, gate lid closed
+    const envS = Object.assign({}, env || {}, { pumpSolid: true, gate: 'closed' });
+    for (let k = 0; k < 30 && (!lastO || lastO.code < 0); k++) {
+      const q = k === 0 && best ? best : (spec.kind === 'top' ? proposeTop(rng, target, [0, 0, 0]) : randPoint(rng, spec, [0, 0]));
+      startState(spec, q, st); const ts = T0(q); const rec = new Rec(ts, st[0], st[1]);
+      const r = steer(st, ts, envS, target, rec); if (r.o.code >= 0 || !lastO) { lastRec = rec; lastO = r.o; }
+      if (hit(r.o, target)) return { method: 'fallback', n, rec, out: r.o, bump: true };
+    }
+    if (lastO && lastO.code >= 0) lastO.bump = true;
+  }
+  if (target.slot !== undefined && lastO && lastO.code >= 0) { correct(lastRec, target.slot); lastO.code = target.slot; lastO.x = slotCenter(target.slot); return { method: 'corrector', n, rec: lastRec, out: lastO }; }
+  return { method: 'fail', n, rec: lastRec, out: lastO };
+}
+
+const API = { TOP, G, nails, present, sim, search, buildTable, Rec, slotOf, slotCenter, correct, rowX, get TABLE() { return TABLE; }, set TABLE(t) { TABLE = t; } };
+if (typeof module !== 'undefined' && module.exports) module.exports = API; else root.MFPhys = API;
+})(typeof self !== 'undefined' ? self : this);
+
+// Midnight Fair — pack planner: turns an RNG outcome (slots, gate ride, chain length) into flights.
+(function (root) {
+'use strict';
+const P = (typeof module !== 'undefined' && module.exports) ? require('./phys.js') : root.MFPhys;
+const G = P.G;
+const RIDE = 2.6;              // seconds a wisp spends in the wheel (settle + half-turn + reveal)
+const EXIT = { x: G.WX, y: G.WY + G.WR + 7 };
+function railTime(x0) { return 0.38 + (G.FW - x0) / 700; } // up the right rail + along the top rail to x0
+
+// candidate pumpkin positions: lattice nails in rows 1..8 away from the wheel and walls
+const PUMP_CAND = G.nails.filter(n => n.row >= 1 && n.row <= 7 && n.x > 20 && n.x < G.FW - 20 && Math.hypot(n.x - G.WX, n.y - G.WY) > G.WR + 26);
+function pumpLayout(rng, count) {
+  for (let k = 0; k < 50; k++) { const o = pumpLayout1(rng, count); if (o.length >= count) return o; }
+  return pumpLayout1(rng, count);
+}
+function pumpLayout1(rng, count) {
+  const out = [], pool = PUMP_CAND.slice();
+  while (out.length < count && pool.length) {
+    const i = Math.floor(rng() * pool.length), n = pool.splice(i, 1)[0];
+    if (out.some(p => Math.hypot(p.x - n.x, p.y - n.y) < 33)) continue;
+    out.push({ x: n.x, y: n.y, nail: n.id, tb: Infinity, claimed: false });
+  }
+  return out;
+}
+
+function packTiming(n, turbo) { return turbo ? 0.2 : (n > 5 ? 0.42 : 0.6); }
+
+// spec: { wisps:[{slot, gate?}], packSize, B, gateOpen, pumps (layout|null), interval, presSeed }
+// returns { flights:[{entry, t0, t1, pts, imps, method, kind, ride?, pump?}], pumps, stats }
+function planPack(spec) {
+  const rng = P.__rngFrom ? P.__rngFrom(spec.presSeed) : mulberry(spec.presSeed);
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const r = tryPlan(spec, rng);
+    if (r) { r.attempts = attempt + 1; return r; }
+  }
+  throw new Error('planPack failed');
+}
+function mulberry(seed) { let a = seed >>> 0; return function () { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+
+function tryPlan(spec, rng) {
+  const n = spec.wisps.length, ps = spec.packSize || n, iv = spec.interval || 0.42;
+  const pumps = spec.pumps ? spec.pumps.map(p => Object.assign({}, p, { tb: Infinity, claimed: false })) : null;
+  const env = { gate: spec.gateOpen ? 'open' : 'closed', pumps };
+  const stats = { main: 0, fallback: 0, corrector: 0, fail: 0, cand: 0 };
+  const flights = [];
+  const note = (r) => { stats[r.method]++; stats.cand += r.n; if (r.bump || (r.out && r.out.bump)) stats.bump = (stats.bump || 0) + 1; };
+  // initial segments: top launches
+  const segs = [];
+  for (let i = 0; i < ps; i++) segs.push({ kind: 'top', launch: i * iv, init: true, idx: i });
+  // which entry is the gate ride (if any)
+  const gateEntry = spec.wisps.findIndex(w => w.gate);
+  let gateSeg = null;
+  if (gateEntry >= 0) { gateSeg = segs[Math.min(ps - 1, Math.floor(rng() * ps))]; gateSeg.reserved = true; }
+  // ---- Multiball chain: realise B breaks ----
+  let breaksLeft = spec.B || 0;
+  const finals = [];
+  if (breaksLeft > 0) {
+    const children = []; let nextInit = 0;
+    const inits = segs.filter(s => !s.reserved);
+    while (breaksLeft > 0) {
+      let seg = children.pop();
+      if (!seg) { if (nextInit >= inits.length) break; seg = inits[nextInit++]; }
+      const t0 = seg.kind === 'top' ? seg.launch + 0 : seg.t0;
+      const r = flySeg(rng, seg, { pump: true }, env, 700);
+      if (r && r.out.code === -4) {
+        note(r); const pi = r.out.pump, p = pumps[pi]; p.claimed = true; p.tb = r.out.t;
+        flights.push(mkFlight(seg, r, -1, 'break')); flights[flights.length - 1].pump = pi;
+        breaksLeft--;
+        // burst: parent + 2 new wisps fly out of the pumpkin
+        const ang = Math.atan2(r.out.y - p.y, r.out.x - p.x);
+        const sx = p.x + Math.cos(ang) * (G.PR + G.R + 0.6), sy = p.y + Math.sin(ang) * (G.PR + G.R + 0.6);
+        for (let c = 0; c < 3; c++) children.push({ kind: 'point', x: sx, y: sy, t0: r.out.t + 0.02, a0: ang - 1.45, a1: ang + 1.45, s0: 140, s1: 380, child: true, from: pi });
+        // shuffle children so the chain is not always the same branch
+        for (let i = children.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); const t = children[i]; children[i] = children[j]; children[j] = t; }
+      } else { seg.triedBreak = true; finals.push(seg); }
+    }
+    if (breaksLeft > 0) return null;
+    for (const c of children) finals.push(c);
+    for (let i = nextInit; i < inits.length; i++) finals.push(inits[i]);
+  } else for (const s of segs) if (!s.reserved) finals.push(s);
+  // ---- assign final slots ----
+  const entries = []; for (let i = 0; i < n; i++) if (i !== gateEntry) entries.push(i);
+  if (entries.length !== finals.length) throw new Error('segment count mismatch ' + entries.length + ' vs ' + finals.length);
+  // reachability estimate for non-top segments
+  for (const s of finals) {
+    s.h = new Float32Array(11).fill(0.02);
+    if (s.kind === 'top') { for (let k = 0; k < 11; k++) s.h[k] += P.TABLE.slot[k].length; }
+    else { const st = [0, 0, 0, 0]; for (let q = 0; q < 48; q++) { const a = s.a0 + rng() * (s.a1 - s.a0), sp = s.s0 + rng() * (s.s1 - s.s0); const o = P.sim(s.x, s.y, Math.cos(a) * sp, Math.sin(a) * sp, s.t0, env, null, false); if (o.code >= 0) s.h[o.code] += 8; } }
+  }
+  const W = spec.W;
+  entries.sort((a, b) => W[spec.wisps[a].slot] - W[spec.wisps[b].slot]); // rarest first
+  const free = finals.slice();
+  for (const e of entries) {
+    const k = spec.wisps[e].slot; let bi = 0, bv = -1;
+    for (let i = 0; i < free.length; i++) { const v = free[i].h[k] * (0.7 + 0.6 * rng()); if (v > bv) { bv = v; bi = i; } }
+    free[bi].entry = e; free.splice(bi, 1);
+  }
+  // 2-opt: swap assignments while it improves the product of reachabilities
+  for (let pass = 0; pass < 3; pass++) {
+    let improved = false;
+    for (let i = 0; i < finals.length; i++) for (let j = i + 1; j < finals.length; j++) {
+      const a = finals[i], b = finals[j], ka = spec.wisps[a.entry].slot, kb = spec.wisps[b.entry].slot; if (ka === kb) continue;
+      if (Math.log(a.h[kb]) + Math.log(b.h[ka]) > Math.log(a.h[ka]) + Math.log(b.h[kb]) + 0.05) { const t = a.entry; a.entry = b.entry; b.entry = t; improved = true; }
+    }
+    if (!improved) break;
+  }
+  // ---- fly finals to their slots ----
+  for (const s of finals) {
+    const r = flySeg(rng, s, { slot: spec.wisps[s.entry].slot }, env, s.kind === 'top' ? 700 : 1500); note(r);
+    flights.push(mkFlight(s, r, s.entry, 'slot'));
+  }
+  // ---- gate ride: fly to the gate, ride the wheel, drop out and fly to the exit slot ----
+  if (gateSeg) {
+    const r = flySeg(rng, gateSeg, { gate: true }, env, 900); note(r);
+    if (r.out.code !== -3) return null;
+    const f = mkFlight(gateSeg, r, gateEntry, 'gate'); f.ride = { tc: r.out.t, te: r.out.t + RIDE, level: spec.wisps[gateEntry].gate }; flights.push(f);
+    const ex = { kind: 'point', x: EXIT.x, y: EXIT.y, t0: r.out.t + RIDE, a0: Math.PI * 0.06, a1: Math.PI * 0.94, s0: 20, s1: 260 };
+    const r2 = flySeg(rng, ex, { slot: spec.wisps[gateEntry].slot }, env, 900); note(r2);
+    flights.push(mkFlight(ex, r2, gateEntry, 'exit'));
+  }
+  // full-crypt guaranteed wheel ride: handled as its own mini pack by the caller
+  flights.sort((a, b) => a.t0 - b.t0);
+  let tEnd = 0; for (const f of flights) tEnd = Math.max(tEnd, f.t1);
+  return { flights, pumps, stats, tEnd };
+}
+
+function flySeg(rng, seg, target, env, budget) {
+  if (seg.kind === 'top') {
+    // the wisp leaves the top rail at x0 after railTime(x0); search over (x0, vx, vy)
+    const r = P.search(rng, { kind: 'top' }, 0, target, env, budget, seg.launch, railTime);
+    return r;
+  }
+  return P.search(rng, { kind: 'point', x: seg.x, y: seg.y, a0: seg.a0, a1: seg.a1, s0: seg.s0, s1: seg.s1 }, seg.t0, target, env, budget);
+}
+function mkFlight(seg, r, entry, kind) {
+  const pts = r.rec.pts; const f = { entry, kind, method: r.method, t0: pts[0], t1: pts[pts.length - 3], pts: Float32Array.from(pts), imps: Float32Array.from(r.rec.imps), init: !!seg.init, idx: seg.idx };
+  if (seg.kind === 'top') f.rail = { launch: seg.launch, x0: pts[1] };
+  else f.from = seg.from;
+  return f;
+}
+
+// blind-test helper: a pure, unsteered pack (natural random launches, physics decides the slots)
+function purePack(spec) {
+  const rng = mulberry(spec.presSeed), n = spec.wisps.length, iv = spec.interval || 0.42, flights = [];
+  for (let i = 0; i < n; i++) {
+    for (let k = 0; k < 50; k++) {
+      const x0 = P.TOP.x0 + rng() * (P.TOP.x1 - P.TOP.x0), vx = P.TOP.v0 + rng() * (P.TOP.v1 - P.TOP.v0), vy = rng() * P.TOP.w1;
+      const t0 = i * iv + railTime(x0); const rec = new P.Rec(t0, x0, G.START_Y); const o = P.sim(x0, G.START_Y, vx, vy, t0, { gate: 'closed' }, rec, false);
+      if (o.code >= 0) { const f = mkFlight({ kind: 'top', launch: i * iv, init: true, idx: i }, { rec, method: 'pure' }, i, 'slot'); f.landed = o.code; flights.push(f); break; }
+    }
+  }
+  flights.sort((a, b) => a.t0 - b.t0); let tEnd = 0; for (const f of flights) tEnd = Math.max(tEnd, f.t1);
+  return { flights, pumps: null, stats: { pure: n }, tEnd, attempts: 1 };
+}
+const API = { planPack, purePack, pumpLayout, RIDE, EXIT, railTime, packTiming, PUMP_CAND };
+if (typeof module !== 'undefined' && module.exports) module.exports = API; else root.MFPlan = API;
+})(typeof self !== 'undefined' ? self : this);
+
+// planning worker: trajectory search off the main thread
+self.onmessage = function (e) {
+  const m = e.data;
+  if (m.type === 'init') { const t = performance.now(); MFPhys.buildTable(MFLogic.rngFrom(m.seed), 6000); self.postMessage({ type: 'ready', ms: performance.now() - t }); return; }
+  if (m.type === 'plan') {
+    const t = performance.now(); let r;
+    try { r = m.pure ? MFPlan.purePack(m.spec) : MFPlan.planPack(m.spec); } catch (err) { self.postMessage({ type: 'plan', id: m.id, error: String(err && err.stack || err) }); return; }
+    r.ms = performance.now() - t; const tr = []; for (const f of r.flights) tr.push(f.pts.buffer, f.imps.buffer);
+    self.postMessage({ type: 'plan', id: m.id, plan: r }, tr);
+  }
+};
+</script>
+<script>
+// Midnight Fair — game math / outcome logic (pure, shared by UI, worker and math sim)
+(function (root) {
+'use strict';
+function rngFrom(seed) { // mulberry32
+  let a = seed >>> 0;
+  const f = function () { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  f.state = () => a; f.setState = (s) => { a = s >>> 0; }; return f;
+}
+function pickW(rng, w, tot) { let r = rng() * tot; for (let i = 0; i < w.length; i++) { r -= w[i]; if (r < 0) return i; } return w.length - 1; }
+const sum = (a) => a.reduce((x, y) => x + y, 0);
+
+// ---- data (slot types/prices are data; board geometry is independent) ----
+const CFG = {
+  BET: 10, N: 10,                 // bet buys a pack of 10 wisps; wisp price = BET/N
+  SLOTS: [ // values in wisp prices
+    { t: 'prize', v: 20 }, { t: 'booth', b: 'train', v: 1 }, { t: 'prize', v: 3 }, { t: 'prize', v: 1 }, { t: 'empty', v: 0 },
+    { t: 'booth', b: 'pumpkin', v: 1 },
+    { t: 'empty', v: 0 }, { t: 'prize', v: 1 }, { t: 'prize', v: 3 }, { t: 'booth', b: 'crypt', v: 1 }, { t: 'prize', v: 20 }],
+  // RNG weights per slot (binomial-like: centre frequent, edges rare). Sum = 10000.
+  W: [25, 250, 260, 480, 3175, 1400, 3175, 480, 260, 250, 25],
+  // slot weights for a wisp dropping out of the Ferris wheel (it exits low, in the centre)
+  WEXIT: [0, 0, 400, 1500, 2600, 1000, 2600, 1500, 400, 0, 0],
+  // trigger: per game. combos: T, C, P, TC, TP, CP, TCP(=Midnight)
+  TRIG_P: 1 / 88,
+  COMBOS: [['train'], ['crypt'], ['pumpkin'], ['train', 'crypt'], ['train', 'pumpkin'], ['crypt', 'pumpkin'], ['train', 'crypt', 'pumpkin']],
+  COMBO_W: [340, 300, 300, 22, 22, 22, 4],
+  // Ghost Train (Fever)
+  TRAIN_PACKS: 8, TRAIN_PACK: 10, TRAIN_RETRIG: 2, TRAIN_MAXPACKS: 20, DOOR_CAND: [3, 4, 6, 7], DOORS_N: 2, DOOR_V: 3,
+  // Prize Crypt (Hold & Drop)
+  CRYPT_START: 3, CRYPT_RESPINS: 3, CRYPT_PACK: 3,
+  COIN_V: [3, 5, 10, 15, 20, 30, 60, 150],   // in wisp prices (10 = 1x bet)
+  COIN_W: [300, 300, 170, 110, 70, 35, 12, 3],
+  FULL_MULT: 2,
+  // Pumpkin Blast (Multiball)
+  PUMP_PACKS: 5, PUMP_PACK: 5, PUMPKINS: 12, CHAIN_CAP: 10, PUMP_Q: 0.22, MAX_ON_BOARD: 30, BURST_V: 12,
+  // Ferris wheel / jackpots (standalone, fixed, in x bet)
+  GATE_P: 0.0015, GATE_P_MIDNIGHT: 0.012,   // per wisp in a bonus (max one wheel ride per pack)
+  CABINS: ['grand', 'mini', 'minor', 'mini', 'major', 'mini', 'minor', 'mini'], // cabin 0 = V-cabin
+  JP_LEVELS: ['mini', 'minor', 'major', 'grand'], JP_X: { mini: 10, minor: 25, major: 100, grand: 1000 },
+  JP_W: { mini: 6400, minor: 2700, major: 820, grand: 80 },
+};
+CFG.WT = sum(CFG.W); CFG.WEXT = sum(CFG.WEXIT); CFG.COMBO_WT = sum(CFG.COMBO_W); CFG.COIN_WT = sum(CFG.COIN_W);
+const BOOTH_SLOT = { train: 1, pumpkin: 5, crypt: 9 };
+
+function comboName(set) { if (set.length === 3) return 'midnight'; return set.join('+'); }
+function parseCombo(s) { if (!s) return null; if (s === 'midnight') return ['train', 'crypt', 'pumpkin']; const p = s.split(/[+ ,]/).filter(Boolean); const ok = p.every(x => BOOTH_SLOT[x] !== undefined); return ok && p.length ? ['train', 'crypt', 'pumpkin'].filter(x => p.includes(x)) : null; }
+
+// ---- base game: one bet = one pack of N wisps ----
+function playBase(rng, opt) {
+  opt = opt || {};
+  const N = CFG.N, slots = new Array(N);
+  for (let i = 0; i < N; i++) slots[i] = pickW(rng, CFG.W, CFG.WT);
+  let trig = null;
+  const tr = rng();
+  if (opt.forceBonus) trig = opt.forceBonus.slice();
+  else if (tr < CFG.TRIG_P) trig = CFG.COMBOS[pickW(rng, CFG.COMBO_W, CFG.COMBO_WT)].slice();
+  if (trig) { // presentation: the last booth wisp(s) "fill" the sign(s): last k wisps go to the triggered booths
+    for (let j = 0; j < trig.length; j++) slots[N - trig.length + j] = BOOTH_SLOT[trig[j]];
+  }
+  let win = 0; for (const s of slots) win += CFG.SLOTS[s].v;
+  return { slots, winW: win, trig }; // winW in wisp prices
+}
+
+function drawCoin(rng) { return CFG.COIN_V[pickW(rng, CFG.COIN_W, CFG.COIN_WT)]; }
+function drawJP(rng, force) {
+  if (force) return force;
+  const w = CFG.JP_W; let r = rng() * (w.mini + w.minor + w.major + w.grand);
+  for (const k of CFG.JP_LEVELS) { r -= w[k]; if (r < 0) return k; } return 'mini';
+}
+// Multiball chain length (number of pumpkin breaks) via a capped branching process.
+function drawChain(rng, packSize) {
+  const cap = Math.min(CFG.CHAIN_CAP, Math.floor((CFG.MAX_ON_BOARD - packSize) / 2));
+  let open = packSize, B = 0;
+  while (open > 0 && B < cap) { open--; if (rng() < CFG.PUMP_Q) { B++; open += 3; } }
+  return B;
+}
+
+// ---- bonus: any combination of train / crypt / pumpkin. Returns full script (all packs). ----
+function playBonus(rng, set, opt) {
+  opt = opt || {};
+  const T = set.includes('train'), C = set.includes('crypt'), P = set.includes('pumpkin'), M = T && C && P;
+  const packSize = T ? CFG.TRAIN_PACK : P ? CFG.PUMP_PACK : CFG.CRYPT_PACK;
+  const slotPay = T || P; // pure crypt: wisps only place/add coins
+  let trainLeft = T ? CFG.TRAIN_PACKS : 0, pumpLeft = P ? CFG.PUMP_PACKS : 0, respins = C ? CFG.CRYPT_RESPINS : 0;
+  let trainTotal = trainLeft, cryptDone = !C;
+  const doors = [], open = new Set();
+  if (T) { const c = CFG.DOOR_CAND.slice(); for (let i = 0; i < CFG.DOORS_N; i++) doors.push(c.splice(Math.floor(rng() * c.length), 1)[0]); doors.sort((a, b) => a - b); }
+  const coins = new Array(11).fill(0);
+  const startCoins = [];
+  if (C) { const idx = [...Array(11).keys()]; for (let i = 0; i < CFG.CRYPT_START; i++) { const k = Math.floor(rng() * idx.length); const s = idx.splice(k, 1)[0]; const v = drawCoin(rng); coins[s] = v; startCoins.push({ slot: s, v }); } }
+  const gp = M ? CFG.GATE_P_MIDNIGHT : CFG.GATE_P;
+  const packs = []; let payW = 0, jpX = 0; const jps = []; let fullCrypt = false; let forcedJP = opt.forceJackpot || null;
+  let guard = 0;
+  while ((trainLeft > 0 || pumpLeft > 0 || (!cryptDone && respins > 0)) && guard++ < 200) {
+    const B = P ? (opt.forceChain ? Math.min(+opt.forceChain, CFG.CHAIN_CAP, Math.floor((CFG.MAX_ON_BOARD - packSize) / 2)) : drawChain(rng, packSize)) : 0;
+    const n = packSize + 2 * B;
+    const wisps = [];
+    // gate (wheel) entry: per wisp chance, max one per pack
+    let gateIdx = -1;
+    let pg = 1 - Math.pow(1 - gp, n);
+    if (forcedJP && packs.length === 0) pg = 1;
+    if (rng() < pg) gateIdx = Math.floor(rng() * n);
+    let newCoin = false, trainAdd = 0, packPay = B * CFG.BURST_V;
+    for (let i = 0; i < n; i++) {
+      const w = { slot: 0, pay: 0 };
+      if (i === gateIdx) { w.gate = drawJP(rng, forcedJP); forcedJP = null; jpX += CFG.JP_X[w.gate]; jps.push(w.gate); w.slot = pickW(rng, CFG.WEXIT, CFG.WEXT); }
+      else w.slot = pickW(rng, CFG.W, CFG.WT);
+      const sd = CFG.SLOTS[w.slot];
+      if (slotPay) {
+        if (T && doors.includes(w.slot)) { if (!open.has(w.slot)) { open.add(w.slot); w.opens = true; } w.pay = CFG.DOOR_V; }
+        else w.pay = sd.v;
+        if (T && sd.b === 'train' && trainTotal < CFG.TRAIN_MAXPACKS) { const a = Math.min(CFG.TRAIN_RETRIG, CFG.TRAIN_MAXPACKS - trainTotal); trainAdd += a; trainTotal += a; w.retrig = a; }
+      }
+      if (!cryptDone) { const v = drawCoin(rng); w.coin = v; if (coins[w.slot] === 0) newCoin = true; coins[w.slot] += v; }
+      packPay += w.pay; wisps.push(w);
+    }
+    const pack = { n, B, wisps, packSize };
+    if (T) { trainLeft = trainLeft - 1 + trainAdd; }
+    if (P) pumpLeft--;
+    if (!cryptDone) {
+      respins = newCoin ? CFG.CRYPT_RESPINS : respins - 1;
+      if (coins.every(c => c > 0)) { // FULL CRYPT: all coins x2 + guaranteed wheel ride
+        fullCrypt = true; cryptDone = true; for (let k = 0; k < 11; k++) coins[k] *= CFG.FULL_MULT;
+        const jp = drawJP(rng, forcedJP); forcedJP = null; jpX += CFG.JP_X[jp]; jps.push(jp);
+        const ws = pickW(rng, CFG.WEXIT, CFG.WEXT); const sd = CFG.SLOTS[ws];
+        let pay = 0; if (slotPay) pay = (T && open.has(ws)) ? CFG.DOOR_V : sd.v;
+        pack.fullWisp = { slot: ws, gate: jp, pay, full: true }; packPay += pay;
+      } else if (respins <= 0) cryptDone = true;
+    }
+    pack.respins = respins; pack.trainLeft = trainLeft; pack.pumpLeft = pumpLeft; pack.coins = coins.slice(); pack.open = [...open]; pack.packPay = packPay;
+    payW += packPay; packs.push(pack);
+  }
+  const coinW = sum(coins);
+  return { set, packs, startCoins, doors, payW, coinW, jpX, jps, fullCrypt, totalW: payW + coinW + jpX * CFG.N };
+}
+
+// ---- one full game (base + possible bonus), for the math sim ----
+function playGame(rng, opt) {
+  const b = playBase(rng, opt);
+  let bonus = null; if (b.trig) bonus = playBonus(rng, b.trig, opt);
+  return { base: b, bonus, totalW: b.winW + (bonus ? bonus.totalW : 0) };
+}
+const API = { CFG, BOOTH_SLOT, rngFrom, pickW, playBase, playBonus, playGame, drawChain, drawJP, drawCoin, comboName, parseCombo };
+if (typeof module !== 'undefined' && module.exports) module.exports = API; else root.MFLogic = API;
+})(typeof self !== 'undefined' ? self : this);
+
+// Midnight Fair — steered-wisp technology: own 2D sim (circles vs static circles & walls, fixed step),
+// trajectory search (main path), impact steering fallback (±15°), final corrector, anti-stuck.
+(function (root) {
+'use strict';
+const G = {
+  FW: 330, R: 5.5, NR: 3, PR: 8.5, ROWS: 10, ROW0: 64, DY: 30, DX: 30,
+  WX: 165, WY: 196, WR: 52, GATE_Y: 139, GATE_R: 7,
+  DIV_TOP: 360, END_Y: 380, FLOOR: 408, START_Y: 14,
+  GRAV: 980, DT: 1 / 240, E_NAIL: 0.35, E_WALL: 0.5, E_WHEEL: 0.5, E_PUMP: 0.6, FRIC: 0.75, VMAX: 720,
+  TMAX: 9, REC_EVERY: 4, DRAGX: 1 - 1.5 / 240, GFRIC: 0.96, // record at 60 Hz
+};
+G.SLOTS = 11; G.SW = G.FW / G.SLOTS;
+// side guide rails (funnel wisps toward the centre; a narrow channel along each wall leads to the x20 pockets)
+G.SEGS = [];
+function addGuides(list) { for (const g of list) { G.SEGS.push({ ax: g[0], ay: g[1], bx: g[2], by: g[3], r: 2 }); G.SEGS.push({ ax: G.FW - g[0], ay: g[1], bx: G.FW - g[2], by: g[3], r: 2 }); } }
+addGuides(globalThis.MF_GUIDES || [[16, 258, 40, 282], [80, 246, 114, 270]]);
+for (const sg of G.SEGS) { sg.minY = Math.min(sg.ay, sg.by) - 12; sg.maxY = Math.max(sg.ay, sg.by) + 12; sg.dx = sg.bx - sg.ax; sg.dy = sg.by - sg.ay; sg.l2 = sg.dx * sg.dx + sg.dy * sg.dy; }
+function segDist(sg, x, y) { let u = ((x - sg.ax) * sg.dx + (y - sg.ay) * sg.dy) / sg.l2; u = u < 0 ? 0 : u > 1 ? 1 : u; return [sg.ax + u * sg.dx, sg.ay + u * sg.dy]; }
+// nail lattice: present[row][k]; row even: x=15+30k (k 0..10); odd: x=30k (k 1..10)
+const nails = []; // {x,y,row,k,id}
+const present = [];
+function rowX(row, k) { return (row % 2 === 0) ? 15 + 30 * k : (k === 0 ? 1 : k === 11 ? 329 : 30 * k); }
+for (let r = 0; r < G.ROWS; r++) {
+  present.push(new Int16Array(12).fill(-1));
+  const y = G.ROW0 + r * G.DY;
+  const k0 = 0, k1 = (r % 2 === 0) ? 10 : 11; // odd rows get wall kicker nails at x=7 / x=323
+  for (let k = k0; k <= k1; k++) {
+    const x = rowX(r, k);
+    const dw = Math.hypot(x - G.WX, y - G.WY), dg = Math.hypot(x - G.WX, y - G.GATE_Y);
+    if (dw < G.WR + G.NR + 2 * G.R + 1.5) continue;
+    if (dg < 22) continue;
+    let nearSeg = false; for (const sg of G.SEGS) { const q = segDist(sg, x, y); if (Math.hypot(x - q[0], y - q[1]) < sg.r + G.NR + 2 * G.R - 1) nearSeg = true; }
+    if (nearSeg) continue;
+    present[r][k] = nails.length; nails.push({ x, y, row: r, k, id: nails.length });
+  }
+}
+G.nails = nails;
+
+function slotOf(x) { return Math.max(0, Math.min(10, Math.floor(x / G.SW))); }
+function slotCenter(s) { return (s + 0.5) * G.SW; }
+
+// ---- core simulation ----
+// env: { gate: 'closed'|'open', pumps: [{x,y,tb,claimed}] (tb = break time, Infinity if standing), targetPump: bool }
+// returns code: >=0 slot | -1 timeout/stuck | -2 forbidden (gate or pumpkin contact) | -3 gate captured | -4 pumpkin target hit
+const OUT = { code: 0, t: 0, x: 0, y: 0, vx: 0, vy: 0, pump: -1, nImp: 0 };
+function sim(x, y, vx, vy, t0, env, rec, stopAtImpact) {
+  const R = G.R, dt = G.DT, rr = R + G.NR, rr2 = rr * rr, pr = R + G.PR, pr2 = pr * pr;
+  const gateOpen = env && env.gate === 'open', pumps = env && env.pumps, wantPump = env && env.targetPump, wantGate = env && env.targetGate;
+  let t = t0, step = 0, sx = x, sy = y, stuckT = t0 + 0.75, nImp = 0;
+  const wr = G.WR + R, wr2 = wr * wr, gr = G.GATE_R + R, gr2 = gr * gr;
+  while (true) {
+    vy += G.GRAV * dt; vx *= G.DRAGX; x += vx * dt; y += vy * dt; t += dt; step++;
+    let imp = 0, nx = 0, ny = 0, impKind = 0, impId = -1;
+    // walls
+    if (x < R) { x = R; if (vx < 0) { vx = -vx * G.E_WALL; vy *= G.FRIC; if (vx > 30) { imp = 1; impKind = 2; nx = 1; ny = 0; } } }
+    else if (x > G.FW - R) { x = G.FW - R; if (vx > 0) { vx = -vx * G.E_WALL; vy *= G.FRIC; if (vx < -30) { imp = 1; impKind = 2; nx = -1; ny = 0; } } }
+    if (y < R) { y = R; if (vy < 0) vy = -vy * G.E_WALL; }
+    // nails
+    const rf = (y - G.ROW0) / G.DY, row = Math.round(rf);
+    if (row >= 0 && row < G.ROWS) {
+      const ny0 = G.ROW0 + row * G.DY;
+      if (Math.abs(y - ny0) < rr) {
+        const k = (row % 2 === 0) ? Math.round((x - 15) / 30) : (x < 18 ? 0 : x > 312 ? 11 : Math.round(x / 30));
+        if (k >= 0 && k <= 11) {
+          const id = present[row][k];
+          if (id >= 0) {
+            const n = nails[id], dx = x - n.x, dy = y - n.y, d2 = dx * dx + dy * dy;
+            if (d2 < rr2 && d2 > 1e-9) {
+              const d = Math.sqrt(d2), ux = dx / d, uy = dy / d, pen = rr - d; x += ux * pen; y += uy * pen;
+              const vn = vx * ux + vy * uy;
+              if (vn < 0) { const tx = vx - vn * ux, ty = vy - vn * uy; if (vn < -25) { vx = tx * G.FRIC - G.E_NAIL * vn * ux; vy = ty * G.FRIC - G.E_NAIL * vn * uy; } else { vx = tx; vy = ty; } if (vn < -35) { imp = 1; impKind = 1; impId = id; nx = ux; ny = uy; } }
+            }
+          }
+        }
+      }
+    }
+    // guide rails
+    for (let si = 0; si < G.SEGS.length; si++) {
+      const sg = G.SEGS[si]; if (y < sg.minY || y > sg.maxY) continue;
+      let u = ((x - sg.ax) * sg.dx + (y - sg.ay) * sg.dy) / sg.l2; u = u < 0 ? 0 : u > 1 ? 1 : u;
+      const qx = sg.ax + u * sg.dx, qy = sg.ay + u * sg.dy, dx = x - qx, dy = y - qy, d2 = dx * dx + dy * dy, q = R + sg.r;
+      if (d2 < q * q && d2 > 1e-9) { const d = Math.sqrt(d2), ux = dx / d, uy = dy / d; x += ux * (q - d); y += uy * (q - d);
+        const vn = vx * ux + vy * uy; if (vn < 0) { const tx = vx - vn * ux, ty = vy - vn * uy; vx = tx * G.GFRIC - 0.3 * vn * ux; vy = ty * G.GFRIC - 0.3 * vn * uy; if (vn < -60) { imp = 1; impKind = 2; nx = ux; ny = uy; } } }
+    }
+    // pumpkins
+    if (pumps) {
+      for (let i = 0; i < pumps.length; i++) {
+        const p = pumps[i]; if (t >= p.tb) continue;
+        const dx = x - p.x, dy = y - p.y, d2 = dx * dx + dy * dy;
+        if (d2 < pr2) {
+          if (env.pumpSolid) { const d = Math.sqrt(d2) || 1e-6, ux = dx / d, uy = dy / d; x += ux * (pr - d); y += uy * (pr - d); const vn = vx * ux + vy * uy; if (vn < 0) { vx -= (1 + G.E_PUMP) * vn * ux; vy -= (1 + G.E_PUMP) * vn * uy; } continue; }
+          if (wantPump && !p.claimed) { OUT.code = -4; OUT.pump = i; OUT.t = t; OUT.x = x; OUT.y = y; OUT.vx = vx; OUT.vy = vy; OUT.nImp = nImp; if (rec) rec.end(t, x, y); return OUT; }
+          OUT.code = -2; OUT.t = t; OUT.x = x; OUT.y = y; if (rec) rec.end(t, x, y); return OUT;
+        }
+      }
+    }
+    // wheel + gate
+    { const dx = x - G.WX, dy = y - G.WY, d2 = dx * dx + dy * dy;
+      if (d2 < wr2 + 400) {
+        const gdx = x - G.WX, gdy = y - G.GATE_Y, g2 = gdx * gdx + gdy * gdy;
+        if (g2 < gr2) {
+          if (gateOpen) {
+            if (wantGate) { OUT.code = -3; OUT.t = t; OUT.x = x; OUT.y = y; OUT.vx = vx; OUT.vy = vy; OUT.nImp = nImp; if (rec) rec.end(t, x, y); return OUT; }
+            OUT.code = -2; OUT.t = t; OUT.x = x; OUT.y = y; if (rec) rec.end(t, x, y); return OUT;
+          }
+          const d = Math.sqrt(g2) || 1e-6, ux = gdx / d, uy = gdy / d, pen = gr - d; x += ux * pen; y += uy * pen;
+          const vn = vx * ux + vy * uy; if (vn < 0) { const tx = vx - vn * ux, ty = vy - vn * uy; const fr = vn < -25 ? G.FRIC : 1; vx = tx * fr - G.E_WHEEL * vn * ux; vy = ty * fr - G.E_WHEEL * vn * uy; if (vn < -35) { imp = 1; impKind = 3; nx = ux; ny = uy; } }
+        } else if (d2 < wr2) {
+          const d = Math.sqrt(d2), ux = dx / d, uy = dy / d, pen = wr - d; x += ux * pen; y += uy * pen;
+          const vn = vx * ux + vy * uy; if (vn < 0) { const tx = vx - vn * ux, ty = vy - vn * uy; const fr = vn < -25 ? G.FRIC : 1; vx = tx * fr - G.E_WHEEL * vn * ux; vy = ty * fr - G.E_WHEEL * vn * uy; if (vn < -35) { imp = 1; impKind = 3; nx = ux; ny = uy; } }
+        }
+      }
+    }
+    // slot dividers
+    if (y > G.DIV_TOP - R) {
+      const kd = Math.round(x / G.SW);
+      if (kd >= 1 && kd <= 10) {
+        const xd = kd * G.SW;
+        if (y < G.DIV_TOP) { const dx = x - xd, dy = y - G.DIV_TOP, d2 = dx * dx + dy * dy, q = R + 1.5;
+          if (d2 < q * q) { const d = Math.sqrt(d2) || 1e-6, ux = dx / d, uy = dy / d; x += ux * (q - d); y += uy * (q - d); const vn = vx * ux + vy * uy; if (vn < 0) { vx -= 1.4 * vn * ux; vy -= 1.4 * vn * uy; } } }
+        else if (Math.abs(x - xd) < R + 1.5) { const s = x > xd ? 1 : -1; x = xd + s * (R + 1.5); if (vx * s < 0) vx = -vx * 0.3; }
+      }
+    }
+    // speed cap
+    const v2 = vx * vx + vy * vy; if (v2 > G.VMAX * G.VMAX) { const f = G.VMAX / Math.sqrt(v2); vx *= f; vy *= f; }
+    if (imp) nImp++;
+    if (rec) { if (step % G.REC_EVERY === 0) rec.push(t, x, y); if (imp) rec.imp(t, x, y, impKind, impId); }
+    if (y >= G.END_Y) { OUT.code = slotOf(x); OUT.t = t; OUT.x = x; OUT.y = y; OUT.vx = vx; OUT.vy = vy; OUT.nImp = nImp; if (rec) rec.end(t, x, y); return OUT; }
+    if (imp && stopAtImpact && impKind === 1) { OUT.code = -9; OUT.t = t; OUT.x = x; OUT.y = y; OUT.vx = vx; OUT.vy = vy; OUT.nx = nx; OUT.ny = ny; OUT.nImp = nImp; return OUT; }
+    if (t > stuckT) { // anti-stuck: must move at least 3 units per 0.75 s
+      if (Math.abs(x - sx) + Math.abs(y - sy) < 3) { OUT.code = -1; OUT.t = t; if (rec) rec.end(t, x, y); return OUT; }
+      sx = x; sy = y; stuckT = t + 0.75;
+    }
+    if (t - t0 > G.TMAX) { OUT.code = -1; OUT.t = t; if (rec) rec.end(t, x, y); return OUT; }
+  }
+}
+
+function Rec(t0, x, y) { this.t0 = t0; this.pts = [t0, x, y]; this.imps = []; }
+Rec.prototype.push = function (t, x, y) { this.pts.push(t, x, y); };
+Rec.prototype.imp = function (t, x, y, k, id) { this.imps.push(t, x, y, k, id); };
+Rec.prototype.end = function (t, x, y) { const n = this.pts.length; if (this.pts[n - 3] < t) this.pts.push(t, x, y); };
+
+// ---- start conditions ----
+// 'top': wisp leaves the top rail at (x0, START_Y) with velocity (vx0, vy0) (it travelled right->left along the rail)
+const TOP = { x0: 120, x1: 210, v0: -60, v1: 0, w1: 50 };
+function randTop(rng, p) { p[0] = TOP.x0 + rng() * (TOP.x1 - TOP.x0); p[1] = TOP.v0 + rng() * (TOP.v1 - TOP.v0); p[2] = rng() * TOP.w1; return p; }
+// 'point': burst / wheel exit: angle (rad, 0 = right, -PI/2 = up) and speed
+function startState(spec, p, out) {
+  if (spec.kind === 'top') { out[0] = p[0]; out[1] = G.START_Y; out[2] = p[1]; out[3] = p[2]; }
+  else { out[0] = spec.x; out[1] = spec.y; out[2] = Math.cos(p[0]) * p[1]; out[3] = Math.sin(p[0]) * p[1]; }
+  return out;
+}
+function randPoint(rng, spec, p) {
+  const a = spec.a0 + rng() * (spec.a1 - spec.a0), s = spec.s0 + rng() * (spec.s1 - spec.s0); p[0] = a; p[1] = s; return p;
+}
+
+// ---- bias tables for 'top' starts: start conditions that naturally reach each slot / the gate ----
+let TABLE = null;
+function buildTable(rng, n) {
+  const tab = { slot: [], gate: [] }; for (let s = 0; s < 11; s++) tab.slot.push([]);
+  const p = [0, 0, 0], st = [0, 0, 0, 0];
+  for (let i = 0; i < n; i++) {
+    randTop(rng, p); startState({ kind: 'top' }, p, st);
+    const o = sim(st[0], st[1], st[2], st[3], 0, null, null, false);
+    if (o.code >= 0 && tab.slot[o.code].length < 400) tab.slot[o.code].push(p.slice());
+    const o2 = sim(st[0], st[1], st[2], st[3], 0, { gate: 'open', targetGate: true }, null, false);
+    if (o2.code === -3 && tab.gate.length < 400) tab.gate.push(p.slice());
+  }
+  // make sure every slot has entries (edge slots): targeted random fill
+  for (let s = 0; s < 11; s++) { let guard = 0; while (tab.slot[s].length < 40 && guard++ < 200000) { randTop(rng, p); if (s <= 1) p[0] = TOP.x0 + rng() * 110; if (s >= 9) p[0] = TOP.x1 - rng() * 110; startState({ kind: 'top' }, p, st); const o = sim(st[0], st[1], st[2], st[3], 0, null, null, false); if (o.code === s) tab.slot[s].push(p.slice()); } }
+  TABLE = tab; return tab;
+}
+function gauss(rng) { return (rng() + rng() + rng() - 1.5) * 1.41; }
+function proposeTop(rng, target, p) {
+  const list = target.gate ? TABLE.gate : (target.slot !== undefined ? TABLE.slot[target.slot] : null);
+  if (list && list.length && rng() < 0.75) {
+    const b = list[Math.floor(rng() * list.length)], sc = 0.4 + rng() * 1.6;
+    p[0] = Math.max(TOP.x0, Math.min(TOP.x1, b[0] + gauss(rng) * 5 * sc)); p[1] = Math.max(TOP.v0, Math.min(TOP.v1, b[1] + gauss(rng) * 14 * sc)); p[2] = Math.max(0, Math.min(TOP.w1, b[2] + gauss(rng) * 7 * sc));
+    return p;
+  }
+  return randTop(rng, p);
+}
+
+// outcome check for a target
+function hit(o, target) {
+  if (target.gate) return o.code === -3;
+  if (target.pump) return o.code === -4;
+  return o.code === target.slot;
+}
+function miss(o, target) { // distance metric for steering (smaller = better)
+  if (target.gate) return o.code === -3 ? 0 : (o.code >= 0 ? 1000 + Math.abs(o.x - G.WX) : 1e6);
+  if (target.pump) return o.code === -4 ? 0 : (o.code >= 0 ? 1000 : 1e6);
+  if (o.code >= 0) return Math.abs(o.x - slotCenter(target.slot));
+  return 1e6;
+}
+
+// ---- impact steering fallback: at each nail impact rotate the natural bounce by at most ±15°,
+// keeping |v|; choose the deviation by short look-ahead; pure ballistics between impacts. ----
+const ALPHAS = [0, 5, -5, 10, -10, 15, -15].map(a => a * Math.PI / 180);
+function steer(st, t0, env, target, rec) {
+  let x = st[0], y = st[1], vx = st[2], vy = st[3], t = t0, steps = 0, used = 0;
+  const envL = Object.assign({}, env, { targetPump: !!target.pump, targetGate: !!target.gate });
+  for (let iter = 0; iter < 60; iter++) {
+    const o = sim(x, y, vx, vy, t, envL, rec, true);
+    if (o.code !== -9) return { o: copyOut(o), used };
+    x = o.x; y = o.y; t = o.t; const sp = Math.hypot(o.vx, o.vy), nx = o.nx, ny = o.ny;
+    let best = null, bestM = Infinity, bestA = 0;
+    for (const a of ALPHAS) {
+      const c = Math.cos(a), s = Math.sin(a); const rvx = o.vx * c - o.vy * s, rvy = o.vx * s + o.vy * c;
+      if ((rvx * nx + rvy * ny) < 0.2 * sp) continue; // stay inside the natural cone (must leave the nail)
+      const o2 = sim(x, y, rvx, rvy, t, envL, null, false); steps++;
+      const m = miss(o2, target);
+      if (m < bestM - 1e-9 || (hit(o2, target) && !best)) { bestM = m; best = [rvx, rvy]; bestA = a; }
+      if (hit(o2, target)) { best = [rvx, rvy]; bestA = a; bestM = -1; break; }
+    }
+    if (!best) best = [o.vx, o.vy];
+    if (bestA !== 0) used++;
+    vx = best[0]; vy = best[1];
+    if (bestM === -1) { const o3 = sim(x, y, vx, vy, t, envL, rec, false); return { o: copyOut(o3), used }; }
+  }
+  const o4 = sim(x, y, vx, vy, t, envL, rec, false); return { o: copyOut(o4), used };
+}
+function copyOut(o) { return { code: o.code, t: o.t, x: o.x, y: o.y, vx: o.vx, vy: o.vy, pump: o.pump, nImp: o.nImp }; }
+
+// final corrector (last resort, smooth lateral blend over the last rows into the decided slot)
+function correct(rec, slot) {
+  const P = rec.pts, n = P.length / 3; const xc = slotCenter(slot);
+  let iA = -1, iB = n - 1;
+  for (let i = 0; i < n; i++) { const y = P[i * 3 + 2]; if (iA < 0 && y > 250) iA = i; if (y > G.DIV_TOP - 8) { iB = i; break; } }
+  if (iA < 0) iA = Math.max(0, n - 30);
+  if (iB <= iA) iB = Math.min(n - 1, iA + 10);
+  const dxEnd = xc - P[iB * 3 + 1];
+  for (let i = iA; i < n; i++) {
+    let u = (i - iA) / Math.max(1, iB - iA); if (u > 1) u = 1; const s = u * u * (3 - 2 * u);
+    if (i <= iB) P[i * 3 + 1] += dxEnd * s; else { const x = P[i * 3 + 1] + dxEnd; P[i * 3 + 1] = xc + (x - xc) * 0.2; }
+  }
+  P[P.length - 2] = xc;
+}
+
+// ---- search one flight: main path (candidates) -> fallback steering -> corrector ----
+// spec: start {kind:'top'} or {kind:'point', x, y, a0,a1,s0,s1}; t0: start time
+// target: {slot:k} | {gate:true} | {pump:true}; env: {gate, pumps}
+function search(rng, spec, t0, target, env, budget, launch, railFn) {
+  const T0 = (q) => railFn ? launch + railFn(q[0]) : t0;
+  budget = budget || 500;
+  const p = [0, 0, 0], st = [0, 0, 0, 0];
+  const envL = Object.assign({}, env || {}, { targetPump: !!target.pump, targetGate: !!target.gate });
+  let best = null, bestM = Infinity, n = 0;
+  for (; n < budget; n++) {
+    if (spec.kind === 'top') proposeTop(rng, target, p); else randPoint(rng, spec, p);
+    startState(spec, p, st); const ts = T0(p);
+    const o = sim(st[0], st[1], st[2], st[3], ts, envL, null, false);
+    if (hit(o, target)) {
+      const rec = new Rec(ts, st[0], st[1]); const o2 = sim(st[0], st[1], st[2], st[3], ts, envL, rec, false);
+      return { method: 'main', n: n + 1, params: p.slice(), rec, out: copyOut(o2) };
+    }
+    const m = miss(o, target); if (m < bestM) { bestM = m; best = p.slice(); }
+  }
+  // fallback: impact steering from the best candidates (try a few)
+  const tries = [best];
+  for (let k = 0; k < 6; k++) { const q = [0, 0, 0]; if (spec.kind === 'top') proposeTop(rng, target, q); else randPoint(rng, spec, q); tries.push(q); }
+  let lastRec = null, lastO = null;
+  for (const q of tries) {
+    if (!q) continue;
+    startState(spec, q, st); const ts = T0(q); const rec = new Rec(ts, st[0], st[1]);
+    const r = steer(st, ts, env || {}, target, rec);
+    if (hit(r.o, target)) return { method: 'fallback', n, params: q.slice(), rec, out: r.o, steered: r.used };
+    if (!lastO || (r.o.code >= 0 && lastO.code < 0)) { lastRec = rec; lastO = r.o; }
+  }
+  if (target.slot !== undefined && (!lastO || lastO.code < 0)) { // last resort: pumpkins act as solid bumpers, gate lid closed
+    const envS = Object.assign({}, env || {}, { pumpSolid: true, gate: 'closed' });
+    for (let k = 0; k < 30 && (!lastO || lastO.code < 0); k++) {
+      const q = k === 0 && best ? best : (spec.kind === 'top' ? proposeTop(rng, target, [0, 0, 0]) : randPoint(rng, spec, [0, 0]));
+      startState(spec, q, st); const ts = T0(q); const rec = new Rec(ts, st[0], st[1]);
+      const r = steer(st, ts, envS, target, rec); if (r.o.code >= 0 || !lastO) { lastRec = rec; lastO = r.o; }
+      if (hit(r.o, target)) return { method: 'fallback', n, rec, out: r.o, bump: true };
+    }
+    if (lastO && lastO.code >= 0) lastO.bump = true;
+  }
+  if (target.slot !== undefined && lastO && lastO.code >= 0) { correct(lastRec, target.slot); lastO.code = target.slot; lastO.x = slotCenter(target.slot); return { method: 'corrector', n, rec: lastRec, out: lastO }; }
+  return { method: 'fail', n, rec: lastRec, out: lastO };
+}
+
+const API = { TOP, G, nails, present, sim, search, buildTable, Rec, slotOf, slotCenter, correct, rowX, get TABLE() { return TABLE; }, set TABLE(t) { TABLE = t; } };
+if (typeof module !== 'undefined' && module.exports) module.exports = API; else root.MFPhys = API;
+})(typeof self !== 'undefined' ? self : this);
+
+// Midnight Fair — pack planner: turns an RNG outcome (slots, gate ride, chain length) into flights.
+(function (root) {
+'use strict';
+const P = (typeof module !== 'undefined' && module.exports) ? require('./phys.js') : root.MFPhys;
+const G = P.G;
+const RIDE = 2.6;              // seconds a wisp spends in the wheel (settle + half-turn + reveal)
+const EXIT = { x: G.WX, y: G.WY + G.WR + 7 };
+function railTime(x0) { return 0.38 + (G.FW - x0) / 700; } // up the right rail + along the top rail to x0
+
+// candidate pumpkin positions: lattice nails in rows 1..8 away from the wheel and walls
+const PUMP_CAND = G.nails.filter(n => n.row >= 1 && n.row <= 7 && n.x > 20 && n.x < G.FW - 20 && Math.hypot(n.x - G.WX, n.y - G.WY) > G.WR + 26);
+function pumpLayout(rng, count) {
+  for (let k = 0; k < 50; k++) { const o = pumpLayout1(rng, count); if (o.length >= count) return o; }
+  return pumpLayout1(rng, count);
+}
+function pumpLayout1(rng, count) {
+  const out = [], pool = PUMP_CAND.slice();
+  while (out.length < count && pool.length) {
+    const i = Math.floor(rng() * pool.length), n = pool.splice(i, 1)[0];
+    if (out.some(p => Math.hypot(p.x - n.x, p.y - n.y) < 33)) continue;
+    out.push({ x: n.x, y: n.y, nail: n.id, tb: Infinity, claimed: false });
+  }
+  return out;
+}
+
+function packTiming(n, turbo) { return turbo ? 0.2 : (n > 5 ? 0.42 : 0.6); }
+
+// spec: { wisps:[{slot, gate?}], packSize, B, gateOpen, pumps (layout|null), interval, presSeed }
+// returns { flights:[{entry, t0, t1, pts, imps, method, kind, ride?, pump?}], pumps, stats }
+function planPack(spec) {
+  const rng = P.__rngFrom ? P.__rngFrom(spec.presSeed) : mulberry(spec.presSeed);
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const r = tryPlan(spec, rng);
+    if (r) { r.attempts = attempt + 1; return r; }
+  }
+  throw new Error('planPack failed');
+}
+function mulberry(seed) { let a = seed >>> 0; return function () { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+
+function tryPlan(spec, rng) {
+  const n = spec.wisps.length, ps = spec.packSize || n, iv = spec.interval || 0.42;
+  const pumps = spec.pumps ? spec.pumps.map(p => Object.assign({}, p, { tb: Infinity, claimed: false })) : null;
+  const env = { gate: spec.gateOpen ? 'open' : 'closed', pumps };
+  const stats = { main: 0, fallback: 0, corrector: 0, fail: 0, cand: 0 };
+  const flights = [];
+  const note = (r) => { stats[r.method]++; stats.cand += r.n; if (r.bump || (r.out && r.out.bump)) stats.bump = (stats.bump || 0) + 1; };
+  // initial segments: top launches
+  const segs = [];
+  for (let i = 0; i < ps; i++) segs.push({ kind: 'top', launch: i * iv, init: true, idx: i });
+  // which entry is the gate ride (if any)
+  const gateEntry = spec.wisps.findIndex(w => w.gate);
+  let gateSeg = null;
+  if (gateEntry >= 0) { gateSeg = segs[Math.min(ps - 1, Math.floor(rng() * ps))]; gateSeg.reserved = true; }
+  // ---- Multiball chain: realise B breaks ----
+  let breaksLeft = spec.B || 0;
+  const finals = [];
+  if (breaksLeft > 0) {
+    const children = []; let nextInit = 0;
+    const inits = segs.filter(s => !s.reserved);
+    while (breaksLeft > 0) {
+      let seg = children.pop();
+      if (!seg) { if (nextInit >= inits.length) break; seg = inits[nextInit++]; }
+      const t0 = seg.kind === 'top' ? seg.launch + 0 : seg.t0;
+      const r = flySeg(rng, seg, { pump: true }, env, 700);
+      if (r && r.out.code === -4) {
+        note(r); const pi = r.out.pump, p = pumps[pi]; p.claimed = true; p.tb = r.out.t;
+        flights.push(mkFlight(seg, r, -1, 'break')); flights[flights.length - 1].pump = pi;
+        breaksLeft--;
+        // burst: parent + 2 new wisps fly out of the pumpkin
+        const ang = Math.atan2(r.out.y - p.y, r.out.x - p.x);
+        const sx = p.x + Math.cos(ang) * (G.PR + G.R + 0.6), sy = p.y + Math.sin(ang) * (G.PR + G.R + 0.6);
+        for (let c = 0; c < 3; c++) children.push({ kind: 'point', x: sx, y: sy, t0: r.out.t + 0.02, a0: ang - 1.45, a1: ang + 1.45, s0: 140, s1: 380, child: true, from: pi });
+        // shuffle children so the chain is not always the same branch
+        for (let i = children.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); const t = children[i]; children[i] = children[j]; children[j] = t; }
+      } else { seg.triedBreak = true; finals.push(seg); }
+    }
+    if (breaksLeft > 0) return null;
+    for (const c of children) finals.push(c);
+    for (let i = nextInit; i < inits.length; i++) finals.push(inits[i]);
+  } else for (const s of segs) if (!s.reserved) finals.push(s);
+  // ---- assign final slots ----
+  const entries = []; for (let i = 0; i < n; i++) if (i !== gateEntry) entries.push(i);
+  if (entries.length !== finals.length) throw new Error('segment count mismatch ' + entries.length + ' vs ' + finals.length);
+  // reachability estimate for non-top segments
+  for (const s of finals) {
+    s.h = new Float32Array(11).fill(0.02);
+    if (s.kind === 'top') { for (let k = 0; k < 11; k++) s.h[k] += P.TABLE.slot[k].length; }
+    else { const st = [0, 0, 0, 0]; for (let q = 0; q < 48; q++) { const a = s.a0 + rng() * (s.a1 - s.a0), sp = s.s0 + rng() * (s.s1 - s.s0); const o = P.sim(s.x, s.y, Math.cos(a) * sp, Math.sin(a) * sp, s.t0, env, null, false); if (o.code >= 0) s.h[o.code] += 8; } }
+  }
+  const W = spec.W;
+  entries.sort((a, b) => W[spec.wisps[a].slot] - W[spec.wisps[b].slot]); // rarest first
+  const free = finals.slice();
+  for (const e of entries) {
+    const k = spec.wisps[e].slot; let bi = 0, bv = -1;
+    for (let i = 0; i < free.length; i++) { const v = free[i].h[k] * (0.7 + 0.6 * rng()); if (v > bv) { bv = v; bi = i; } }
+    free[bi].entry = e; free.splice(bi, 1);
+  }
+  // 2-opt: swap assignments while it improves the product of reachabilities
+  for (let pass = 0; pass < 3; pass++) {
+    let improved = false;
+    for (let i = 0; i < finals.length; i++) for (let j = i + 1; j < finals.length; j++) {
+      const a = finals[i], b = finals[j], ka = spec.wisps[a.entry].slot, kb = spec.wisps[b.entry].slot; if (ka === kb) continue;
+      if (Math.log(a.h[kb]) + Math.log(b.h[ka]) > Math.log(a.h[ka]) + Math.log(b.h[kb]) + 0.05) { const t = a.entry; a.entry = b.entry; b.entry = t; improved = true; }
+    }
+    if (!improved) break;
+  }
+  // ---- fly finals to their slots ----
+  for (const s of finals) {
+    const r = flySeg(rng, s, { slot: spec.wisps[s.entry].slot }, env, s.kind === 'top' ? 700 : 1500); note(r);
+    flights.push(mkFlight(s, r, s.entry, 'slot'));
+  }
+  // ---- gate ride: fly to the gate, ride the wheel, drop out and fly to the exit slot ----
+  if (gateSeg) {
+    const r = flySeg(rng, gateSeg, { gate: true }, env, 900); note(r);
+    if (r.out.code !== -3) return null;
+    const f = mkFlight(gateSeg, r, gateEntry, 'gate'); f.ride = { tc: r.out.t, te: r.out.t + RIDE, level: spec.wisps[gateEntry].gate }; flights.push(f);
+    const ex = { kind: 'point', x: EXIT.x, y: EXIT.y, t0: r.out.t + RIDE, a0: Math.PI * 0.06, a1: Math.PI * 0.94, s0: 20, s1: 260 };
+    const r2 = flySeg(rng, ex, { slot: spec.wisps[gateEntry].slot }, env, 900); note(r2);
+    flights.push(mkFlight(ex, r2, gateEntry, 'exit'));
+  }
+  // full-crypt guaranteed wheel ride: handled as its own mini pack by the caller
+  flights.sort((a, b) => a.t0 - b.t0);
+  let tEnd = 0; for (const f of flights) tEnd = Math.max(tEnd, f.t1);
+  return { flights, pumps, stats, tEnd };
+}
+
+function flySeg(rng, seg, target, env, budget) {
+  if (seg.kind === 'top') {
+    // the wisp leaves the top rail at x0 after railTime(x0); search over (x0, vx, vy)
+    const r = P.search(rng, { kind: 'top' }, 0, target, env, budget, seg.launch, railTime);
+    return r;
+  }
+  return P.search(rng, { kind: 'point', x: seg.x, y: seg.y, a0: seg.a0, a1: seg.a1, s0: seg.s0, s1: seg.s1 }, seg.t0, target, env, budget);
+}
+function mkFlight(seg, r, entry, kind) {
+  const pts = r.rec.pts; const f = { entry, kind, method: r.method, t0: pts[0], t1: pts[pts.length - 3], pts: Float32Array.from(pts), imps: Float32Array.from(r.rec.imps), init: !!seg.init, idx: seg.idx };
+  if (seg.kind === 'top') f.rail = { launch: seg.launch, x0: pts[1] };
+  else f.from = seg.from;
+  return f;
+}
+
+// blind-test helper: a pure, unsteered pack (natural random launches, physics decides the slots)
+function purePack(spec) {
+  const rng = mulberry(spec.presSeed), n = spec.wisps.length, iv = spec.interval || 0.42, flights = [];
+  for (let i = 0; i < n; i++) {
+    for (let k = 0; k < 50; k++) {
+      const x0 = P.TOP.x0 + rng() * (P.TOP.x1 - P.TOP.x0), vx = P.TOP.v0 + rng() * (P.TOP.v1 - P.TOP.v0), vy = rng() * P.TOP.w1;
+      const t0 = i * iv + railTime(x0); const rec = new P.Rec(t0, x0, G.START_Y); const o = P.sim(x0, G.START_Y, vx, vy, t0, { gate: 'closed' }, rec, false);
+      if (o.code >= 0) { const f = mkFlight({ kind: 'top', launch: i * iv, init: true, idx: i }, { rec, method: 'pure' }, i, 'slot'); f.landed = o.code; flights.push(f); break; }
+    }
+  }
+  flights.sort((a, b) => a.t0 - b.t0); let tEnd = 0; for (const f of flights) tEnd = Math.max(tEnd, f.t1);
+  return { flights, pumps: null, stats: { pure: n }, tEnd, attempts: 1 };
+}
+const API = { planPack, purePack, pumpLayout, RIDE, EXIT, railTime, packTiming, PUMP_CAND };
+if (typeof module !== 'undefined' && module.exports) module.exports = API; else root.MFPlan = API;
+})(typeof self !== 'undefined' ? self : this);
+
+</script>
+<script>
+// Midnight Fair — UI / renderer / game flow
+(function () {
+'use strict';
+const L = MFLogic, P = MFPhys, PL = MFPlan, C = L.CFG, G = P.G;
+const Q = new URLSearchParams(location.search);
+const PARAM = { seed: Q.get('seed'), bonus: L.parseCombo(Q.get('bonus')), jackpot: Q.get('jackpot'), turbo: Q.get('turbo') === '1', debug: Q.get('debug') === '1', blind: Q.get('blind') === '1', mute: Q.get('mute') === '1', chain: Q.get('chain'), recall: Q.get('recall') === '1', fresh: Q.get('fresh') === '1' };
+if (PARAM.jackpot && !C.JP_X[PARAM.jackpot]) PARAM.jackpot = null;
+const BET = C.BET, WP = BET / C.N, TABLE_SEED = 20261004;
+const NS = PARAM.seed !== null ? 'mfS_' : 'mf_';
+const store = { get(k, d) { try { const v = localStorage.getItem(NS + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } }, set(k, v) { try { localStorage.setItem(NS + k, JSON.stringify(v)); } catch (e) { } } };
+if (PARAM.fresh || PARAM.seed !== null) { store.set('bal', 1000); store.set('pending', 0); store.set('signs', [0.25, 0.3, 0.2]); }
+let bal = store.get('bal', 1000); const pend = store.get('pending', 0); if (pend > 0) { bal += pend; store.set('pending', 0); store.set('bal', bal); }
+let lastWin = 0;
+const signFill = store.get('signs', [0.25, 0.3, 0.2]); // train, pumpkin, crypt (left->right), purely visual
+const SIGN_OF = { train: 0, pumpkin: 1, crypt: 2 };
+let rng = L.rngFrom(PARAM.seed !== null ? (+PARAM.seed >>> 0) : ((crypto.getRandomValues(new Uint32Array(1))[0]) >>> 0));
+const presRng = L.rngFrom(((PARAM.seed !== null ? +PARAM.seed : Date.now()) * 2654435761) >>> 0);
+let recallNext = null;
+let forceBonus = PARAM.bonus || (PARAM.jackpot ? ['train'] : null), forceJP = PARAM.jackpot;
+
+// ---------- canvas / layout ----------
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d'), cvbg = document.getElementById('cvbg');
+const STW = 372, STH = 684, FX = 13, FY = 128; // stage units; field origin
+const SIGN_Y = 6, SIGN_H = 108, SIGN_X = [70, 186, 302];
+const SHELF_Y = 578;
+let DPR = 1, CW = 0, CH = 0, K = 1, OX = 0, OY = 0; // K: device px per stage unit
+let bgc = null;
+const A = {}; const ASSETS = ['bg', 'sign_train', 'sign_train_dim', 'sign_crypt', 'sign_crypt_dim', 'sign_pumpkin', 'sign_pumpkin_dim', 'slot_empty', 'slot_prize', 'slot_train', 'slot_crypt', 'slot_pumpkin', 'slot_door', 'plush_mini', 'plush_minor', 'plush_major', 'plush_grand', 'cabin', 'cabin_v', 'hub'];
+function loadAssets() { return Promise.all(ASSETS.map(n => new Promise((res) => { const im = new Image(); im.onload = () => { A[n] = im; res(); }; im.onerror = () => res(); im.src = 'assets/' + n + '.webp'; }))); }
+function mk(w, h) { const c = document.createElement('canvas'); c.width = Math.max(1, Math.ceil(w)); c.height = Math.max(1, Math.ceil(h)); return c; }
+
+const SPR = {};
+const SKIP = window.__SKIP = {}; window.__draw = (t) => draw(t); let GLGEN = 0; const GLC = new Map(); // big glows pre-scaled to device pixels (upscaled drawImage is very slow on CPU-raster canvases)
+function GL(name, w, h) { const W = Math.max(2, Math.round(w * K)), H = Math.max(2, Math.round(h * K)); const key = name + W + 'x' + H; let c = GLC.get(key); if (!c) { if (GLC.size > 300) { GLC.clear(); GLGEN++; } c = document.createElement('canvas'); c.width = W; c.height = H; const g2 = c.getContext('2d'); g2.imageSmoothingQuality = 'high'; g2.drawImage(SPR[name], 0, 0, W, H); GLC.set(key, c); } return c; }
+// integer-pixel blits of pre-scaled sprites (no resampling): much cheaper than scaled drawImage on CPU-raster canvases
+function blitF(c, x, y) { ctx.drawImage(c, Math.round(OX + (FX + x) * K), Math.round(OY + (FY + y) * K)); } // field coords, top-left; identity transform expected
+function blitFC(c, x, y) { ctx.drawImage(c, Math.round(OX + (FX + x) * K - c.width / 2), Math.round(OY + (FY + y) * K - c.height / 2)); } // field coords, centered
+function blitS(c, x, y) { ctx.drawImage(c, Math.round(OX + x * K), Math.round(OY + y * K)); } // stage coords, top-left
+function blitSC(c, x, y) { ctx.drawImage(c, Math.round(OX + x * K - c.width / 2), Math.round(OY + y * K - c.height / 2)); }
+const I0 = () => ctx.setTransform(1, 0, 0, 1, 0, 0), IS = () => ctx.setTransform(K, 0, 0, K, OX, OY), IF = () => ctx.setTransform(K, 0, 0, K, OX + FX * K, OY + FY * K);
+const TXC = new Map(); // cached text sprites (text rendering every frame is costly)
+function txt(text, size, fam, fill, stroke, lw, x, y, align) { // stage coords, baseline middle; expects stage transform, restores it
+  const key = size + fam + fill + stroke + lw + '|' + text; let c = TXC.get(key);
+  if (!c) { if (TXC.size > 400) TXC.clear(); c = document.createElement('canvas'); let g2 = c.getContext('2d'); const f = (size * K) + 'px ' + fam; g2.font = f; const pad = Math.ceil(lw * K + 2);
+    c.width = Math.ceil(g2.measureText(text).width + pad * 2); c.height = Math.ceil(size * K * 1.35 + pad * 2); g2 = c.getContext('2d'); g2.font = f; g2.textBaseline = 'middle'; g2.textAlign = 'left'; g2.lineJoin = 'round';
+    if (lw) { g2.lineWidth = lw * K; g2.strokeStyle = stroke; g2.strokeText(text, pad, c.height / 2); } g2.fillStyle = fill; g2.fillText(text, pad, c.height / 2); TXC.set(key, c); }
+  const dx = align === 'center' ? -c.width / 2 : align === 'right' ? -c.width : 0; I0(); ctx.drawImage(c, Math.round(OX + x * K + dx), Math.round(OY + y * K - c.height / 2)); IS();
+}
+const RIMC = []; const RIM_N = 72; // rim has 8-fold symmetry: cache rotated frames over 45 degrees
+function rimFrame(th) { const P4 = Math.PI / 4; let a = th % P4; if (a < 0) a += P4; const i = Math.round(a / P4 * RIM_N) % RIM_N; let c = RIMC[i];
+  if (!c) { const S = Math.ceil(88 * K) + 2; c = document.createElement('canvas'); c.width = c.height = S; const g2 = c.getContext('2d'); g2.imageSmoothingQuality = 'high'; g2.translate(S / 2, S / 2); g2.rotate(i / RIM_N * P4); g2.drawImage(SPR.rim, -44 * K, -44 * K, 88 * K, 88 * K); RIMC[i] = c; } return c; }
+const SGC = {}; // sign composites (dim + lit at quantized alpha)
+function signC(k, a) { const q = Math.max(0, Math.min(16, Math.round(a * 16))); const key = k + q; let c = SGC[key];
+  if (!c) { const sp = SPR.signs[k]; c = document.createElement('canvas'); c.width = sp.dim.width; c.height = sp.dim.height; const g2 = c.getContext('2d'); g2.drawImage(sp.dim, 0, 0); g2.globalAlpha = q / 16; g2.drawImage(sp.lit, 0, 0); SGC[key] = c; } return c; }
+function dGL(c, x, y, w, h) { ctx.imageSmoothingEnabled = false; ctx.drawImage(c, x, y, w, h); ctx.imageSmoothingEnabled = true; }
+function makeSprites() {
+  GLC.clear(); GLGEN++; TXC.clear(); RIMC.length = 0; for (const k in SGC) delete SGC[k]; const s = K;
+  const glow = (r, stops) => { const c = mk(r * 2 * s, r * 2 * s), g = c.getContext('2d'), R = r * s; const gr = g.createRadialGradient(R, R, 0, R, R, R); for (const [o, col] of stops) gr.addColorStop(o, col); g.fillStyle = gr; g.fillRect(0, 0, c.width, c.height); return c; };
+  SPR.wisp = glow(14, [[0, 'rgba(245,255,230,1)'], [0.16, 'rgba(210,255,150,1)'], [0.34, 'rgba(120,255,60,0.75)'], [0.6, 'rgba(70,230,40,0.22)'], [1, 'rgba(40,200,30,0)']]);
+  SPR.wispGold = glow(16, [[0, 'rgba(255,255,235,1)'], [0.16, 'rgba(255,230,140,1)'], [0.36, 'rgba(255,170,40,0.8)'], [0.65, 'rgba(255,120,20,0.22)'], [1, 'rgba(255,90,0,0)']]);
+  SPR.trail = glow(7, [[0, 'rgba(160,255,90,0.9)'], [0.5, 'rgba(90,240,50,0.35)'], [1, 'rgba(60,220,30,0)']]);
+  SPR.spark = glow(5, [[0, 'rgba(255,255,220,1)'], [0.4, 'rgba(255,210,120,0.6)'], [1, 'rgba(255,160,60,0)']]);
+  SPR.flame = glow(6, [[0, 'rgba(255,250,210,1)'], [0.3, 'rgba(255,190,80,0.85)'], [0.7, 'rgba(255,110,20,0.25)'], [1, 'rgba(255,80,0,0)']]);
+  SPR.orange = glow(30, [[0, 'rgba(255,190,90,0.9)'], [0.5, 'rgba(255,120,20,0.35)'], [1, 'rgba(255,90,0,0)']]);
+  SPR.teal = glow(30, [[0, 'rgba(120,255,240,0.9)'], [0.5, 'rgba(30,220,210,0.35)'], [1, 'rgba(0,200,200,0)']]);
+  SPR.gold = glow(30, [[0, 'rgba(255,240,170,0.95)'], [0.5, 'rgba(255,190,40,0.4)'], [1, 'rgba(255,170,0,0)']]);
+  SPR.green = glow(30, [[0, 'rgba(200,255,150,0.9)'], [0.5, 'rgba(100,255,50,0.35)'], [1, 'rgba(60,230,20,0)']]);
+  SPR.purple = glow(30, [[0, 'rgba(220,170,255,0.9)'], [0.5, 'rgba(150,80,255,0.35)'], [1, 'rgba(120,40,255,0)']]);
+  // nail head
+  { const r = 4.2, c = mk(r * 2 * s, r * 2 * s), g = c.getContext('2d'); g.scale(s, s); const gr = g.createRadialGradient(r - 1.2, r - 1.3, 0.3, r, r, r); gr.addColorStop(0, '#fff6d8'); gr.addColorStop(0.35, '#e0b25c'); gr.addColorStop(0.75, '#7a5420'); gr.addColorStop(1, 'rgba(40,20,10,0)'); g.fillStyle = gr; g.beginPath(); g.arc(r, r, r, 0, 7); g.fill(); SPR.nail = c; }
+  // pumpkin bumper
+  { const r = 11, c = mk(r * 2 * s, r * 2 * s), g = c.getContext('2d'); g.scale(s, s); g.translate(r, r + 0.5);
+    for (const [ox, w, col] of [[-5, 5.5, '#c4510c'], [5, 5.5, '#c4510c'], [-2.4, 5.6, '#e8701a'], [2.4, 5.6, '#e8701a'], [0, 5, '#ff8f2a']]) { g.fillStyle = col; g.beginPath(); g.ellipse(ox, 0, w, 8, 0, 0, 7); g.fill(); }
+    const hl = g.createRadialGradient(-3, -4, 0.5, -3, -4, 7); hl.addColorStop(0, 'rgba(255,230,170,0.7)'); hl.addColorStop(1, 'rgba(255,200,120,0)'); g.fillStyle = hl; g.beginPath(); g.ellipse(0, 0, 10, 8, 0, 0, 7); g.fill();
+    g.fillStyle = '#4a7a1c'; g.fillRect(-1.2, -10.5, 2.4, 4); g.fillStyle = '#ffe36a'; g.beginPath(); g.moveTo(-6, -2); g.lineTo(-2.5, -3.5); g.lineTo(-3, 0); g.fill(); g.beginPath(); g.moveTo(6, -2); g.lineTo(2.5, -3.5); g.lineTo(3, 0); g.fill();
+    g.beginPath(); g.moveTo(-6, 2); g.quadraticCurveTo(0, 7.5, 6, 2); g.quadraticCurveTo(0, 4.5, -6, 2); g.fill(); SPR.pumpkin = c; }
+  // coin
+  { const r = 13, c = mk(r * 2 * s, r * 2 * s), g = c.getContext('2d'); g.scale(s, s); const gr = g.createRadialGradient(r - 4, r - 5, 1, r, r, r); gr.addColorStop(0, '#fff7c8'); gr.addColorStop(0.45, '#f2c24a'); gr.addColorStop(0.85, '#a8701a'); gr.addColorStop(1, '#5a3a0a'); g.fillStyle = gr; g.beginPath(); g.arc(r, r, r - 0.5, 0, 7); g.fill(); g.strokeStyle = 'rgba(90,50,0,0.6)'; g.lineWidth = 1.2; g.beginPath(); g.arc(r, r, r - 3.5, 0, 7); g.stroke(); SPR.coin = c; }
+  // wheel rim (rotating part)
+  { const R = 44, c = mk(R * 2 * s, R * 2 * s), g = c.getContext('2d'); g.scale(s, s); g.translate(R, R);
+    g.strokeStyle = '#3a2160'; g.lineWidth = 2.2; for (let i = 0; i < 16; i++) { const a = i * Math.PI / 8; g.beginPath(); g.moveTo(Math.cos(a) * 9, Math.sin(a) * 9); g.lineTo(Math.cos(a) * 39, Math.sin(a) * 39); g.stroke(); }
+    g.strokeStyle = '#2a1650'; g.lineWidth = 1; for (let i = 0; i < 16; i++) { const a = i * Math.PI / 8, b = (i + 1) * Math.PI / 8; g.beginPath(); g.moveTo(Math.cos(a) * 26, Math.sin(a) * 26); g.lineTo(Math.cos(b) * 39, Math.sin(b) * 39); g.moveTo(Math.cos(a) * 39, Math.sin(a) * 39); g.lineTo(Math.cos(b) * 26, Math.sin(b) * 26); g.stroke(); }
+    g.lineWidth = 3.4; g.strokeStyle = '#4b2a7a'; g.beginPath(); g.arc(0, 0, 39, 0, 7); g.stroke(); g.lineWidth = 1.2; g.strokeStyle = '#8a5cc8'; g.beginPath(); g.arc(0, 0, 40.2, 0, 7); g.stroke();
+    g.lineWidth = 2.2; g.strokeStyle = '#3e2368'; g.beginPath(); g.arc(0, 0, 26, 0, 7); g.stroke();
+    for (let i = 0; i < 32; i++) { const a = i * Math.PI / 16; const x = Math.cos(a) * 39, y = Math.sin(a) * 39; const gg = g.createRadialGradient(x, y, 0, x, y, 3.2); gg.addColorStop(0, 'rgba(255,240,190,1)'); gg.addColorStop(0.4, 'rgba(255,190,80,0.8)'); gg.addColorStop(1, 'rgba(255,150,40,0)'); g.fillStyle = gg; g.fillRect(x - 3.2, y - 3.2, 6.4, 6.4); }
+    SPR.rim = c; }
+  // cabins (pre-scaled), badges
+  const cab = (im, h) => { if (!im) return null; const w = h * im.width / im.height, c = mk(w * s, h * s); c.getContext('2d').drawImage(im, 0, 0, c.width, c.height); c.uw = w; c.uh = h; return c; };
+  SPR.cabin = cab(A.cabin, 21); SPR.cabinV = cab(A.cabin_v, 25); SPR.hub = cab(A.hub, 20);
+  SPR.textCache = new Map();
+  SPR.signs = {}; for (const k of ['train', 'pumpkin', 'crypt']) { const lit = A['sign_' + k], dim = A['sign_' + k + '_dim']; if (!lit) continue; const h = SIGN_H, w = h * lit.width / lit.height; const sc = (im) => { const c = mk(w * s, h * s); c.getContext('2d').drawImage(im, 0, 0, c.width, c.height); c.uw = w; c.uh = h; return c; }; SPR.signs[k] = { lit: sc(lit), dim: sc(dim) }; }
+}
+const JP_COL = { mini: '#c58cff', minor: '#9dff6a', major: '#ff9a3a', grand: '#ffd54a' };
+const JP_GLOW = { mini: 'purple', minor: 'green', major: 'orange', grand: 'gold' };
+const SLOT_ART = ['slot_prize', 'slot_train', 'slot_prize', 'slot_prize', 'slot_empty', 'slot_pumpkin', 'slot_empty', 'slot_prize', 'slot_prize', 'slot_crypt', 'slot_prize'];
+const BOOTH_COL = { train: '#38f3e0', pumpkin: '#ff8a1f', crypt: '#ffcf3a' };
+const SIGN_KEYS = ['train', 'pumpkin', 'crypt'];
+const fmt = (n) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+
+let booted = false;
+function resize(force) {
+  if (!booted && !force) return;
+  DPR = Math.min(window.devicePixelRatio || 1, typeof DPRCAP === 'number' ? DPRCAP : 2.5);
+  const r = cv.getBoundingClientRect(); const w = Math.round(r.width * DPR), h = Math.round(r.height * DPR);
+  if (!force && w === CW && h === CH && bgc) return; CW = cv.width = cvbg.width = w; CH = cv.height = cvbg.height = h;
+  K = Math.min(CW / STW, CH / STH); OX = Math.round((CW - STW * K) / 2); OY = Math.round(Math.max(0, (CH - STH * K) * 0.3));
+  makeSprites(); drawBG();
+}
+
+// ---------- static background layer ----------
+function drawBG() {
+  bgc = cvbg; const g = bgc.getContext('2d'); g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
+  g.fillStyle = '#0d0720'; g.fillRect(0, 0, CW, CH);
+  const im = A.bg; if (im) { const sc = Math.max(CW / im.width, CH / im.height); const w = im.width * sc, h = im.height * sc; const fx = 0.5; let x = CW / 2 - w * fx; x = Math.min(0, Math.max(CW - w, x)); g.drawImage(im, x, (CH - h) * 0.35, w, h); }
+  let gr = g.createLinearGradient(0, 0, 0, CH); gr.addColorStop(0, 'rgba(10,4,30,0.25)'); gr.addColorStop(0.5, 'rgba(10,4,30,0.35)'); gr.addColorStop(1, 'rgba(8,3,20,0.75)'); g.fillStyle = gr; g.fillRect(0, 0, CW, CH);
+  g.setTransform(K, 0, 0, K, OX, OY);
+  // marquee beam with bulbs behind the signs
+  g.fillStyle = 'rgba(20,8,40,0.55)'; rr(g, 4, 2, STW - 8, 118, 10); g.fill();
+  // board frame
+  const bx = FX - 9, by = FY - 9, bw = 330 + 16 + 18, bh = 436 + 18;
+  g.save(); g.shadowColor = 'rgba(0,0,0,0.8)'; g.shadowBlur = 14; g.fillStyle = '#2a1408'; rr(g, bx, by, bw, bh, 26); g.fill(); g.restore();
+  gr = g.createLinearGradient(bx, 0, bx + bw, 0); gr.addColorStop(0, '#5a2e12'); gr.addColorStop(0.5, '#7a4318'); gr.addColorStop(1, '#4a250e'); g.fillStyle = gr; rr(g, bx, by, bw, bh, 26); g.fill();
+  g.strokeStyle = 'rgba(255,170,80,0.35)'; g.lineWidth = 1; rr(g, bx + 2, by + 2, bw - 4, bh - 4, 24); g.stroke();
+  // field panel
+  g.save(); g.translate(FX, FY);
+  rr(g, 0, 0, 346, 436, 22); g.save(); g.clip();
+  gr = g.createLinearGradient(0, 0, 0, 436); gr.addColorStop(0, '#1b0f3e'); gr.addColorStop(0.55, '#170b34'); gr.addColorStop(1, '#100726'); g.fillStyle = gr; g.fillRect(0, 0, 346, 436);
+  const rg = g.createRadialGradient(165, 190, 10, 165, 190, 260); rg.addColorStop(0, 'rgba(120,70,200,0.28)'); rg.addColorStop(1, 'rgba(60,20,120,0)'); g.fillStyle = rg; g.fillRect(0, 0, 346, 436);
+  if (A.bg) { g.globalAlpha = 0.13; g.drawImage(A.bg, 300, 120, 500, 420, 0, 0, 330, 360); g.globalAlpha = 1; }
+  g.strokeStyle = 'rgba(255,255,255,0.025)'; g.lineWidth = 1; for (let x = 22; x < 330; x += 22) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x, 436); g.stroke(); }
+  // launch rail lane (right)
+  g.fillStyle = 'rgba(0,0,0,0.35)'; g.fillRect(330, 0, 16, 436);
+  g.restore();
+  // rails: right wall + top track
+  g.strokeStyle = '#c99a4a'; g.lineWidth = 1.6; g.beginPath(); g.moveTo(331, 436); g.lineTo(331, 44); g.stroke();
+  g.strokeStyle = 'rgba(255,200,120,0.55)'; g.lineWidth = 1; g.beginPath(); g.moveTo(345, 436); g.lineTo(345, 40); g.arc(310, 40, 35, 0, -Math.PI / 2, true); g.lineTo(30, 5); g.stroke();
+  // side guide rails
+  for (const sg of G.SEGS) { g.strokeStyle = '#5a3412'; g.lineWidth = 5; g.lineCap = 'round'; g.beginPath(); g.moveTo(sg.ax, sg.ay); g.lineTo(sg.bx, sg.by); g.stroke(); g.strokeStyle = '#e2b25a'; g.lineWidth = 2.4; g.stroke(); g.strokeStyle = 'rgba(255,240,200,0.7)'; g.lineWidth = 0.8; g.beginPath(); g.moveTo(sg.ax, sg.ay - 0.8); g.lineTo(sg.bx, sg.by - 0.8); g.stroke(); }
+  // nails
+  for (const n of P.nails) { g.fillStyle = 'rgba(0,0,0,0.35)'; g.beginPath(); g.arc(n.x + 0.8, n.y + 1.2, 3.2, 0, 7); g.fill(); g.drawImage(SPR.nail, n.x - 4.2, n.y - 4.2, 8.4, 8.4); }
+  // wheel hub stand shadow
+  const wg = g.createRadialGradient(G.WX, G.WY, 20, G.WX, G.WY, 64); wg.addColorStop(0, 'rgba(255,140,40,0.10)'); wg.addColorStop(1, 'rgba(255,140,40,0)'); g.fillStyle = wg; g.beginPath(); g.arc(G.WX, G.WY, 64, 0, 7); g.fill();
+  // slots
+  for (let s = 0; s < 11; s++) {
+    const x = s * 30; const im = A[SLOT_ART[s]];
+    g.fillStyle = s % 2 ? 'rgba(0,0,0,0.22)' : 'rgba(0,0,0,0.12)'; g.fillRect(x, 360, 30, 62);
+    if (im) { const tw = SLOT_ART[s] === 'slot_prize' ? 27 : 28, th = tw * im.height / im.width; const hh = Math.min(th, 58); const ww = hh * im.width / im.height; g.drawImage(im, x + 15 - ww / 2, 421 - hh, ww, hh); }
+  }
+  for (let k = 1; k <= 10; k++) { const x = k * 30; const pg = g.createLinearGradient(x - 2, 0, x + 2, 0); pg.addColorStop(0, '#6a4318'); pg.addColorStop(0.5, '#f0c470'); pg.addColorStop(1, '#6a4318'); g.fillStyle = pg; g.fillRect(x - 1.5, 360, 3, 62); g.drawImage(SPR.nail, x - 3, 356, 6, 6); }
+  // value strip
+  g.fillStyle = '#120722'; g.fillRect(0, 421, 330, 15); g.strokeStyle = 'rgba(255,170,60,0.5)'; g.lineWidth = 0.8; g.beginPath(); g.moveTo(0, 421); g.lineTo(330, 421); g.stroke();
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  for (let s = 0; s < 11; s++) { const sd = C.SLOTS[s]; let t, col, fs = 11;
+    if (sd.t === 'prize') { t = '×' + sd.v; col = sd.v >= 20 ? '#ffd54a' : sd.v >= 3 ? '#ffb070' : '#e8d6ff'; if (sd.v >= 20) fs = 12.5; }
+    else if (sd.t === 'empty') { t = '—'; col = '#7d6aa0'; }
+    else { t = sd.b === 'train' ? 'TRAIN' : sd.b === 'crypt' ? 'CRYPT' : 'BLAST'; col = BOOTH_COL[sd.b]; fs = 8.6; }
+    g.font = fs + 'px Bangers'; g.fillStyle = col; g.fillText(t, s * 30 + 15, 429); }
+  g.restore();
+  // plush shelf (shooting gallery wall)
+  drawShelf(g);
+  g.setTransform(1, 0, 0, 1, 0, 0);
+}
+function rr(g, x, y, w, h, r) { g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath(); }
+const PLUSH = [ // level, sprite, x center, height, plaque box (normalized)
+  { lv: 'mini', im: 'plush_mini', x: 58, h: 70, pb: [0.423, 0.55, 0.762, 0.8] },
+  { lv: 'minor', im: 'plush_minor', x: 140, h: 74, pb: [0.346, 0.46, 0.874, 0.71] },
+  { lv: 'major', im: 'plush_major', x: 220, h: 78, pb: [0.389, 0.545, 0.889, 0.745] },
+  { lv: 'grand', im: 'plush_grand', x: 308, h: 92, pb: [0.2, 0.596, 0.714, 0.773] }];
+function drawShelf(g) {
+  const y = SHELF_Y, h = STH - y - 2;
+  g.save(); g.shadowColor = 'rgba(0,0,0,0.7)'; g.shadowBlur = 10; g.fillStyle = '#2b0f14'; rr(g, 4, y, STW - 8, h, 10); g.fill(); g.restore();
+  g.save(); rr(g, 4, y, STW - 8, h, 10); g.clip();
+  const gr = g.createLinearGradient(0, y, 0, y + h); gr.addColorStop(0, '#3a1a22'); gr.addColorStop(1, '#1e0a10'); g.fillStyle = gr; g.fillRect(4, y, STW - 8, h);
+  g.strokeStyle = 'rgba(0,0,0,0.35)'; g.lineWidth = 1; for (let yy = y + 26; yy < y + h; yy += 12) { g.beginPath(); g.moveTo(4, yy); g.lineTo(STW - 4, yy); g.stroke(); }
+  for (let i = 0; i < 16; i++) { g.fillStyle = i % 2 ? '#e9e0d0' : '#b3201e'; g.beginPath(); g.moveTo(4 + i * 24, y); g.lineTo(28 + i * 24, y); g.lineTo(28 + i * 24, y + 10); g.quadraticCurveTo(16 + i * 24, y + 17, 4 + i * 24, y + 10); g.fill(); }
+  g.fillStyle = '#6b3a14'; g.fillRect(4, y + h - 10, STW - 8, 10); g.fillStyle = '#a56a2c'; g.fillRect(4, y + h - 10, STW - 8, 2);
+  for (let i = 0; i < 14; i++) { const x = 16 + i * 26.5; const bg = g.createRadialGradient(x, y + 19, 0, x, y + 19, 4); bg.addColorStop(0, 'rgba(255,240,180,1)'); bg.addColorStop(1, 'rgba(255,170,60,0)'); g.fillStyle = bg; g.fillRect(x - 4, y + 15, 8, 8); }
+  g.restore();
+  for (const p of PLUSH) drawPlush(g, p, 1, 0);
+}
+function drawPlush(g, p, sc, lift) {
+  const im = A[p.im]; if (!im) return; const h = p.h * sc, w = h * im.width / im.height, x = p.x - w / 2, y = STH - 12 - h - lift;
+  g.drawImage(im, x, y, w, h);
+  const [a, b, c, d] = p.pb; const px = x + (a + c) / 2 * w, py = y + (b + d) / 2 * h, pw = (c - a) * w;
+  const val = fmt(C.JP_X[p.lv] * BET); const fs = Math.min(pw / (val.length * 0.55 + 0.4), 13 * sc);
+  g.font = fs + 'px Bangers'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.lineWidth = 2.2; g.strokeStyle = 'rgba(40,16,4,0.9)'; g.strokeText(val, px, py + 0.5); g.fillStyle = JP_COL[p.lv]; g.fillText(val, px, py + 0.5);
+  g.font = 7.5 * sc + 'px Bangers'; g.fillStyle = '#fff0d0'; g.strokeText(p.lv.toUpperCase(), p.x, STH - 7 - lift); g.fillText(p.lv.toUpperCase(), p.x, STH - 7 - lift);
+}
+
+// ---------- audio (WebAudio synth) ----------
+const AU = { ctx: null, on: !PARAM.mute, lastBell: 0, master: null, music: null };
+function audioInit() {
+  if (AU.ctx || !AU.on) return; try { AU.ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+  AU.master = AU.ctx.createGain(); AU.master.gain.value = 0.55; AU.master.connect(AU.ctx.destination); startCalliope();
+}
+function tone(f, d, type, vol, when, slide) { if (!AU.ctx) return; const t = AU.ctx.currentTime + (when || 0), o = AU.ctx.createOscillator(), g = AU.ctx.createGain(); o.type = type || 'sine'; o.frequency.setValueAtTime(f, t); if (slide) o.frequency.exponentialRampToValueAtTime(slide, t + d); g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, t + d); o.connect(g); g.connect(AU.master); o.start(t); o.stop(t + d + 0.02); }
+const PENTA = [0, 3, 5, 7, 10, 12, 15, 17];
+function sBell(y) { if (!AU.ctx) return; const n = performance.now(); if (n - AU.lastBell < 45) return; AU.lastBell = n; const f = 880 * Math.pow(2, PENTA[Math.floor(Math.random() * 8)] / 12) * (1.3 - y / 900); tone(f, 0.18, 'sine', 0.05); tone(f * 2.76, 0.07, 'sine', 0.015); }
+function sThud() { tone(110, 0.22, 'sine', 0.14, 0, 55); tone(70, 0.3, 'triangle', 0.08); }
+function sCoin() { tone(1568, 0.09, 'square', 0.035); tone(2093, 0.16, 'square', 0.03, 0.06); }
+function sBooth(col) { [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.16, 'triangle', 0.07, i * 0.06)); }
+function sFanfare(big) { const seq = big ? [523, 659, 784, 1047, 784, 1047, 1319] : [523, 659, 784, 1047]; seq.forEach((f, i) => { tone(f, 0.22, 'square', 0.045, i * 0.09); tone(f / 2, 0.22, 'triangle', 0.05, i * 0.09); }); }
+function sPop() { tone(300, 0.12, 'square', 0.06, 0, 900); tone(160, 0.2, 'triangle', 0.07); }
+function sWhoosh() { tone(220, 0.5, 'sawtooth', 0.03, 0, 880); }
+function sJackpot() { for (let i = 0; i < 10; i++) tone(659 * Math.pow(2, (i % 5) / 6), 0.18, 'square', 0.04, i * 0.08); }
+function startCalliope() { // minor waltz loop, quiet
+  const mel = [57, 60, 64, 62, 60, 59, 57, 0, 64, 65, 64, 62, 60, 59, 60, 0, 57, 60, 64, 69, 68, 64, 65, 0, 64, 62, 60, 59, 57, 56, 57, 0];
+  let i = 0; const beat = 0.24;
+  AU.music = setInterval(() => { if (!AU.ctx || AU.ctx.state !== 'running' || document.hidden) return; const n = mel[i % mel.length]; i++; if (n) { const f = 440 * Math.pow(2, (n - 69) / 12); tone(f, beat * 0.9, 'triangle', 0.018); tone(f * 2, beat * 0.5, 'square', 0.005); } if (i % 3 === 1) tone(110 * Math.pow(2, ((mel[(i - 1) % mel.length] || 57) - 57 - 12) / 12), 0.12, 'triangle', 0.02); }, beat * 1000);
+}
+
+// ---------- worker / planning ----------
+let worker = null, workerReady = false; const waiters = new Map(); let reqN = 0; let readyCbs = [];
+function initPlanner() {
+  return new Promise((res) => {
+    const src = document.getElementById('wsrc');
+    try { worker = new Worker(URL.createObjectURL(new Blob([src.textContent], { type: 'text/javascript' }))); } catch (e) { worker = null; }
+    if (!worker) { P.buildTable(L.rngFrom(TABLE_SEED), 6000); res(); return; }
+    let done = false; const fb = setTimeout(() => { if (!done) { done = true; worker = null; P.buildTable(L.rngFrom(TABLE_SEED), 6000); res(); } }, 6000);
+    worker.onmessage = (e) => { const m = e.data; if (m.type === 'ready') { if (!done) { done = true; clearTimeout(fb); workerReady = true; res(); } } else if (m.type === 'plan') { const w = waiters.get(m.id); waiters.delete(m.id); if (w) { if (m.error) w.rej(new Error(m.error)); else w.res(m.plan); } } };
+    worker.onerror = () => { if (!done) { done = true; clearTimeout(fb); worker = null; P.buildTable(L.rngFrom(TABLE_SEED), 6000); res(); } };
+    worker.postMessage({ type: 'init', seed: TABLE_SEED });
+  });
+}
+function plan(spec, pure) {
+  if (worker && workerReady) return new Promise((res, rej) => { const id = ++reqN; waiters.set(id, { res, rej }); worker.postMessage({ type: 'plan', id, spec, pure: !!pure }); });
+  return new Promise((res) => { const t = performance.now(); const r = pure ? PL.purePack(spec) : PL.planPack(spec); r.ms = performance.now() - t; res(r); });
+}
+
+// ---------- game state ----------
+let mode = 'loading'; const setMode = (m) => { mode = m; document.body.dataset.mode = m; };
+let game = null, pack = null, bonusRun = null; let seq = []; // seq: queued timed steps
+const FX_ = { sparks: [], floats: [], flyers: [], bursts: [], banner: null, sweep: 0, shake: 0, celeb: null, toast: null, jpHi: null };
+const wheel = { theta: 0, omega: 0.32, base: 0, segs: null, ride: null, gateOpen: false };
+const stats = { games: 0, packs: 0, methods: { main: 0, fallback: 0, corrector: 0, pure: 0 }, lastPlanMs: 0, cand: 0, wisps: 0 };
+let crypt = null, doors = null, pumpsVis = null;
+
+function topbar() { document.getElementById('bal').textContent = fmt(bal); document.getElementById('winv').textContent = fmt(lastWin); document.getElementById('bet').textContent = BET; }
+function save() { store.set('bal', bal); store.set('signs', signFill.map(v => Math.min(0.92, v))); }
+
+function rollGame() {
+  const st = rng.state(); const opt = {}; if (forceBonus) opt.forceBonus = forceBonus; if (forceJP) opt.forceJackpot = forceJP; if (PARAM.chain) opt.forceChain = PARAM.chain;
+  const base = L.playBase(rng, opt); let bonus = null; if (base.trig) bonus = L.playBonus(rng, base.trig, opt);
+  forceBonus = null; forceJP = null;
+  const g = { rngState: st, base, bonus, presSeed: (presRng() * 4294967296) >>> 0, baseWin: base.winW * WP, bonusWin: bonus ? bonus.totalW * WP : 0 };
+  if (recallNext) { g.presSeed = recallNext.presSeed; g.recall = recallNext; recallNext = null; }
+  g.total = g.baseWin + g.bonusWin; return g;
+}
+function startGame() {
+  audioInit(); if (AU.ctx && AU.ctx.state === 'suspended') AU.ctx.resume();
+  if (bal < BET) { bal += 1000; toast('FREE CREDITS +1,000'); }
+  bal -= BET; lastWin = 0; topbar();
+  game = rollGame(); stats.games++;
+  const pure = game.recall ? !!game.recall.pure : (PARAM.blind && presRng() < 0.5); game.pure = pure;
+  if (pure) { game.base.trig = null; game.bonus = null; game.bonusWin = 0; }
+  store.set('pending', pure ? 0 : game.total); save();
+  store.set('last', { rngState: game.rngState, presSeed: game.presSeed, pure });
+  if (PARAM.blind) { (window.__blindLog = window.__blindLog || []).push({ game: stats.games, pure }); console.log('[blind] game', stats.games, pure ? 'PURE SIM' : 'steered'); }
+  const spec = { wisps: game.base.slots.map(s => ({ slot: s })), packSize: C.N, B: 0, gateOpen: false, pumps: null, interval: PARAM.turbo ? 0.2 : 0.42, presSeed: game.presSeed, W: C.W };
+  setMode('base');
+  plan(spec, pure).then(p => startPack(p, spec, { kind: 'base' })).catch(err => { console.error(err); finishPackBase(null); });
+}
+
+function startPack(p, spec, ctx2) {
+  pack = { p, spec, ctx: ctx2, t: -0.05, speed: (PARAM.turbo ? 1.8 : 1) * (ctx2.kind === 'bonus' ? 1.25 : 1), sum: 0, edge: false, done: false };
+  for (const f of p.flights) { f.ended = false; f.ii = 0; }
+  stats.packs++; stats.lastPlanMs = p.ms || 0; for (const k in p.stats) if (stats.methods[k] !== undefined) stats.methods[k] += p.stats[k]; stats.cand += p.stats.cand || 0; stats.wisps += spec.wisps.length;
+  pumpsVis = p.pumps ? p.pumps.map(q => ({ x: q.x, y: q.y, tb: q.tb, gone: false })) : null;
+  // wheel schedule for a gate ride
+  wheel.base = wheel.theta; wheel.segs = []; wheel.ride = null;
+  const gf = p.flights.find(f => f.kind === 'gate');
+  if (gf) {
+    const tc = gf.ride.tc, te = gf.ride.te, lv = gf.ride.level; let best = 0, bestD = 1e9;
+    for (let c = 0; c < 8; c++) { if (C.CABINS[c] !== lv) continue; const nat = wheel.base + wheel.omega * tc; let d = (-Math.PI / 2 - c * Math.PI / 4 - nat) % (2 * Math.PI); if (d < 0) d += 2 * Math.PI; if (d < bestD) { bestD = d; best = c; } }
+    wheel.segs.push({ t0: Math.min(0.3, tc * 0.2), t1: Math.max(0.5, tc - 0.15), d: bestD });
+    wheel.segs.push({ t0: tc + 0.3, t1: tc + 2.0, d: Math.PI - wheel.omega * (te - tc) });
+    wheel.ride = { f: gf, tc, te, lv, cabin: best, revealed: false };
+  }
+  pack.queue = launchQueue(p);
+}
+function launchQueue(p) { return p.flights.filter(f => f.rail).map(f => f.rail.launch).sort((a, b) => a - b); }
+function wheelAngle(t) { let a = wheel.base + wheel.omega * t; for (const s of wheel.segs) { const u = Math.max(0, Math.min(1, (t - s.t0) / (s.t1 - s.t0))); a += s.d * (u * u * (3 - 2 * u)); } return a; }
+
+function skip() {
+  if (mode === 'base' || mode === 'bonus') { if (!pack) return; const tEnd = pack.p.tEnd + 0.01; advancePack(tEnd, true); pack.t = tEnd; FX_.flyers.forEach(fl => { fl.t = fl.dur; }); return; }
+  if (seq.length) { seq[0].skip = true; }
+}
+cv.addEventListener('pointerdown', (e) => { e.preventDefault(); if (mode === 'idle') startGame(); else skip(); }, { passive: false });
+window.addEventListener('keydown', (e) => { if (e.code === 'Space' || e.code === 'Enter') { if (mode === 'idle') startGame(); else skip(); } if (e.key === 'm') { AU.on = !AU.on; if (AU.master) AU.master.gain.value = AU.on ? 0.55 : 0; } });
+
+// ---------- pack playback ----------
+function fieldToStage(x, y) { return [FX + x, FY + y]; }
+function advancePack(t, quick) {
+  const p = pack.p;
+  for (const f of p.flights) {
+    // impacts
+    while (f.ii < f.imps.length && f.imps[f.ii] <= t) { const ix = f.imps[f.ii + 1], iy = f.imps[f.ii + 2], kind = f.imps[f.ii + 3]; if (!quick) { spark(FX + ix, FY + iy, kind === 1 ? 3 : 5); if (kind !== 2) sBell(iy); } f.ii += 5; }
+    if (!f.ended && t >= f.t1) { f.ended = true; flightEnd(f, quick); }
+  }
+  if (pumpsVis) for (const q of pumpsVis) if (!q.gone && t >= q.tb) q.gone = true;
+  if (wheel.ride && !wheel.ride.revealed && t >= wheel.ride.tc + 2.0) { wheel.ride.revealed = true; jackpotReveal(wheel.ride.lv, quick); }
+}
+function flightEnd(f, quick) {
+  const spec = pack.spec, n = f.pts.length, x = f.pts[n - 2], y = f.pts[n - 1];
+  if (f.kind === 'break') { const q = pack.p.pumps[f.pump]; burst(FX + q.x, FY + q.y, quick); if (!quick) sPop(); const v = C.BURST_V * WP; pack.sum += v; addFloat('+' + fmt(v), FX + q.x, FY + q.y - 10, '#ffb04a', 11, quick); return; }
+  if (f.kind === 'gate') { if (!quick) { sWhoosh(); } return; }
+  const slot = f.landed !== undefined ? f.landed : spec.wisps[f.entry].slot;
+  landing(slot, f.entry, quick, x);
+}
+function landing(slot, e, quick, x) {
+  const sd = C.SLOTS[slot]; const sx = FX + slot * 30 + 15, sy = FY + 392;
+  const ctx2 = pack.ctx;
+  if (ctx2.kind === 'base') {
+    const v = sd.v * WP; pack.sum += v; if (slot === 0 || slot === 10) pack.edge = true;
+    if (sd.t === 'empty') { if (!quick) sThud(); puff(sx, sy, quick); }
+    else if (sd.t === 'prize') { if (!quick) sCoin(); addFloat('+' + fmt(v), sx, sy - 18, v >= 20 ? '#ffd54a' : '#fff1c8', v >= 20 ? 15 : 11, quick); if (v >= 20) { burstGold(sx, sy, quick); } }
+    else { if (!quick) sBooth(); addFloat('+' + fmt(v), sx, sy - 18, BOOTH_COL[sd.b], 11, quick); const trig = game.base.trig; const idx = trig ? trig.indexOf(sd.b) : -1; const isTrig = idx >= 0 && e === C.N - trig.length + idx; signFly(slot, sd.b, isTrig, quick); }
+    return;
+  }
+  // bonus landing
+  const w = pack.spec.wisps[e] || { pay: 0 }; const br = bonusRun;
+  if (w.opens && doors) { doors.open.add(slot); doors.anim[slot] = 0; if (!quick) { tone(392, 0.25, 'triangle', 0.08); tone(587, 0.3, 'triangle', 0.07, 0.08); } addFloat('DOOR OPEN ×3', sx, sy - 34, '#38f3e0', 10, quick); }
+  const v = (w.pay || 0) * WP; if (v > 0) { pack.sum += v; addFloat('+' + fmt(v), sx, sy - 18, doors && doors.open.has(slot) ? '#38f3e0' : '#fff1c8', 11, quick); if (!quick) sCoin(); } else if (!br.crypt || br.slotPay) { if (!quick) sThud(); puff(sx, sy, quick); }
+  if (w.retrig) { br.packsTotal += w.retrig; addFloat('+' + w.retrig + ' PACKS', sx, sy - 46, '#38f3e0', 12, quick); if (!quick) sBooth(); }
+  if (w.coin !== undefined && crypt && !crypt.done) { const cv2 = w.coin * WP; const was = crypt.cells[slot]; crypt.cells[slot] += cv2; crypt.pop[slot] = 0; if (!quick) { if (was === 0) tone(1175, 0.2, 'square', 0.04); else tone(880, 0.15, 'square', 0.035); } addFloat((was === 0 ? '' : '+') + fmt(cv2), sx, sy - 30, '#ffd54a', 11, quick); }
+}
+
+function signFly(slot, b, isTrig, quick) {
+  const si = SIGN_OF[b];
+  if (quick) { signFill[si] = isTrig ? 1 : Math.min(0.9, signFill[si] + 0.09); if (isTrig) signFlash(si); return; }
+  FX_.flyers.push({ x0: FX + slot * 30 + 15, y0: FY + 380, x1: SIGN_X[si], y1: SIGN_Y + SIGN_H * 0.45, t: 0, dur: 0.75, si, isTrig, col: b });
+}
+function signFlash(si) { FX_.signFlash = FX_.signFlash || [0, 0, 0]; FX_.signFlash[si] = 1; }
+
+function finishPackBase() {
+  const g = game; let win = g.baseWin;
+  if (g.pure && pack) { win = 0; for (const f of pack.p.flights) win += C.SLOTS[f.landed].v * WP; g.baseWin = win; g.total = win; }
+  const edge = pack ? pack.edge : false;
+  bal += win; lastWin = win; store.set('pending', Math.max(0, (g.pure ? 0 : g.total) - win)); save(); topbar();
+  const steps = [];
+  if (win >= BET) steps.push(celebrate(win, edge ? 'big' : 'win'));
+  if (g.base.trig) steps.push(triggerSeq(g.base.trig));
+  pack = null;
+  runSteps(steps, () => { if (g.bonus) startBonus(); else { store.set('pending', 0); setMode('idle'); } });
+}
+function runSteps(steps, done) { let i = 0; const next = () => { if (i >= steps.length) { done(); return; } const f = steps[i++]; f(next); }; next(); }
+// timed, skippable step
+function timed(dur, onStart, onUpdate, onEnd) { return (next) => { const s = { t: 0, dur, skip: false, upd: onUpdate, end: () => { if (onEnd) onEnd(); next(); } }; if (onStart) onStart(s); seq.push(s); }; }
+function celebrate(v, kind, title) {
+  const dur = kind === 'bonus' ? 4.2 : kind === 'jackpot' ? 3.6 : kind === 'big' ? 2.8 : 1.6;
+  return timed(dur, () => { FX_.celeb = { v, kind, t: 0, dur, title }; if (kind === 'big' || kind === 'bonus' || kind === 'jackpot') { sFanfare(true); coinShower(kind === 'bonus' ? 46 : 30); } else sFanfare(false); }, null, () => { FX_.celeb = null; });
+}
+const BONUS_INFO = {
+  train: { name: 'GHOST TRAIN', sub: 'FEVER · 8 FREE PACKS · OPEN THE CARRIAGE DOORS', col: '#38f3e0' },
+  crypt: { name: 'PRIZE CRYPT', sub: 'HOLD & DROP · FILL ALL 11 SLOTS · 3 RESPINS', col: '#ffcf3a' },
+  pumpkin: { name: 'PUMPKIN BLAST', sub: 'MULTIBALL · PUMPKINS BURST INTO NEW WISPS', col: '#ff8a1f' },
+};
+function bonusTitle(set) { if (set.length === 3) return { name: 'MIDNIGHT!', sub: 'ALL THREE ATTRACTIONS · FERRIS WHEEL GATE OPEN', col: '#c58cff' }; if (set.length === 1) return BONUS_INFO[set[0]]; return { name: set.map(k => BONUS_INFO[k].name).join(' + '), sub: 'COMBINED ATTRACTIONS', col: BONUS_INFO[set[0]].col }; }
+function triggerSeq(set) {
+  return timed(2.4, () => { for (const k of set) { signFill[SIGN_OF[k]] = 1; signFlash(SIGN_OF[k]); } FX_.sweep = 1; sFanfare(true); const bt = bonusTitle(set); FX_.banner = { title: bt.name, sub: bt.sub, col: bt.col, t: 0, dur: 2.4, big: true, midnight: set.length === 3 }; if (set.length === 3) for (let i = 0; i < 12; i++) tone(196, 0.5, 'sine', 0.05, i * 0.16); },
+    null, () => { FX_.banner = null; });
+}
+
+// ---------- bonus ----------
+function startBonus() {
+  const b = game.bonus, set = b.set;
+  bonusRun = { b, set, i: 0, total: 0, crypt: set.includes('crypt'), slotPay: set.includes('train') || set.includes('pumpkin'), packsTotal: set.includes('train') ? C.TRAIN_PACKS : set.includes('pumpkin') ? C.PUMP_PACKS : 0, jp: 0, plans: {} };
+  doors = set.includes('train') ? { list: b.doors.slice(), open: new Set(), anim: {} } : null;
+  crypt = bonusRun.crypt ? { cells: new Array(11).fill(0), pop: {}, respins: C.CRYPT_RESPINS, done: false } : null;
+  if (crypt) for (const c of b.startCoins) { crypt.cells[c.slot] = c.v * WP; crypt.pop[c.slot] = 0; }
+  wheel.gateOpen = true; setMode('bonus');
+  prefetch(0); prefetch(1);
+  setTimeout(() => nextBonusPack(), PARAM.turbo ? 150 : 450);
+}
+function bonusSpec(k) {
+  const pk = bonusRun.b.packs[k], set = bonusRun.set; const seed = (game.presSeed + 7919 * (k + 1)) >>> 0;
+  const r = L.rngFrom(seed ^ 0x5bd1e995);
+  return { wisps: pk.wisps, packSize: pk.packSize, B: pk.B, gateOpen: true, pumps: set.includes('pumpkin') ? PL.pumpLayout(r, C.PUMPKINS) : null, interval: PARAM.turbo ? 0.2 : (pk.packSize > 5 ? 0.3 : pk.packSize > 3 ? 0.45 : 0.5), presSeed: seed, W: C.W };
+}
+function prefetch(k) { if (!bonusRun || k >= bonusRun.b.packs.length || bonusRun.plans[k]) return; const spec = bonusSpec(k); bonusRun.plans[k] = { spec, pr: plan(spec) }; }
+function nextBonusPack() {
+  const br = bonusRun; if (!br) return;
+  if (br.i >= br.b.packs.length) { endBonus(); return; }
+  const k = br.i; prefetch(k); prefetch(k + 1); prefetch(k + 2);
+  const { spec, pr } = br.plans[k];
+  pr.then(p => { startPack(p, spec, { kind: 'bonus', k }); }).catch(err => { console.error(err); br.i++; nextBonusPack(); });
+}
+function finishPackBonus() {
+  const br = bonusRun, pk = br.b.packs[br.i]; br.total += pack.sum; pack = null;
+  if (crypt && !crypt.done) { crypt.respins = pk.respins; if (pk.respins <= 0 && !pk.fullWisp) crypt.done = true; }
+  br.i++;
+  const steps = [];
+  if (pk.fullWisp) steps.push(fullCryptSeq(pk));
+  steps.push(timed(PARAM.turbo ? 0.15 : 0.55));
+  runSteps(steps, () => nextBonusPack());
+}
+function fullCryptSeq(pk) {
+  return (next) => {
+    runSteps([
+      timed(2.2, () => { FX_.banner = { title: 'FULL CRYPT!', sub: 'ALL COINS ×2 · GUARANTEED FERRIS WHEEL RIDE', col: '#ffcf3a', t: 0, dur: 2.2, big: true }; sJackpot(); for (let s = 0; s < 11; s++) { crypt.cells[s] *= C.FULL_MULT; crypt.pop[s] = 0; } crypt.done = true; coinShower(24); }, null, () => { FX_.banner = null; }),
+      (nx) => { const spec = { wisps: [{ slot: pk.fullWisp.slot, gate: pk.fullWisp.gate, pay: pk.fullWisp.pay }], packSize: 1, B: 0, gateOpen: true, pumps: null, interval: 0.4, presSeed: (game.presSeed ^ 0xabcdef) >>> 0, W: C.W };
+        plan(spec).then(p => { startPack(p, spec, { kind: 'bonus', golden: true }); pack.onDone = () => { bonusRun.total += pack.sum; pack = null; nx(); }; }); },
+    ], next);
+  };
+}
+function jackpotReveal(lv, quick) {
+  const v = C.JP_X[lv] * BET; if (pack) pack.sum += v; bonusRun && (bonusRun.jp += v);
+  FX_.jpHi = { lv, t: 0 };
+  if (!quick) { sJackpot(); FX_.banner = { title: lv.toUpperCase() + ' JACKPOT', sub: fmt(v), col: JP_COL[lv], t: 0, dur: 2.2, big: true, jp: true }; coinShower(lv === 'grand' ? 50 : 26); FX_.shake = 0.5; }
+}
+function endBonus() {
+  const br = bonusRun, total = game.bonusWin;
+  const bt = bonusTitle(br.set);
+  runSteps([celebrate(total, 'bonus', bt.name + ' WIN')], () => {
+    bal += total; lastWin = game.baseWin + total; store.set('pending', 0);
+    for (const k of br.set) signFill[SIGN_OF[k]] = 0.12 + Math.random() * 0.1;
+    save(); topbar(); bonusRun = null; doors = null; crypt = null; pumpsVis = null; wheel.gateOpen = false; setMode('idle');
+  });
+}
+
+// ---------- particles / fx ----------
+function spark(x, y, n) { if (QL.lvl >= 2) return; for (let i = 0; i < n; i++) { if (FX_.sparks.length > 160) FX_.sparks.shift(); const a = Math.random() * 6.283, sp = 20 + Math.random() * 60; FX_.sparks.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 20, t: 0, d: 0.25 + Math.random() * 0.2, s: 2 + Math.random() * 2, spr: 'spark' }); } }
+function burst(x, y, quick) { if (quick || FX_.sparks.length > 110) { if (!quick) FX_.bursts.push({ x, y, t: 0 }); return; } for (let i = 0; i < (FX_.sparks.length > 60 ? 6 : 12); i++) { const a = Math.random() * 6.283, sp = 40 + Math.random() * 120; FX_.sparks.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 40, t: 0, d: 0.5 + Math.random() * 0.4, s: 3 + Math.random() * 4, spr: i % 3 ? 'orange' : 'green', g: 200 }); } FX_.bursts.push({ x, y, t: 0 }); }
+function burstGold(x, y, quick) { if (quick) return; for (let i = 0; i < 16; i++) { const a = -Math.PI * Math.random(), sp = 60 + Math.random() * 120; FX_.sparks.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, d: 0.7 + Math.random() * 0.4, s: 3 + Math.random() * 3, spr: 'gold', g: 260 }); } }
+function puff(x, y, quick) { if (quick) return; for (let i = 0; i < 5; i++) FX_.sparks.push({ x: x + (Math.random() - 0.5) * 12, y, vx: (Math.random() - 0.5) * 20, vy: -10 - Math.random() * 15, t: 0, d: 0.6, s: 5, spr: 'purple' }); }
+function coinShower(n) { for (let i = 0; i < n; i++) FX_.sparks.push({ x: 20 + Math.random() * (STW - 40), y: -10 - Math.random() * 120, vx: (Math.random() - 0.5) * 40, vy: 60 + Math.random() * 80, t: 0, d: 2.4, s: 9 + Math.random() * 5, spr: 'coin', g: 240, rot: Math.random() * 6 }); }
+function addFloat(text, x, y, col, size, quick) { if (quick) return; FX_.floats.push({ text, x, y, col, size, t: 0 }); if (FX_.floats.length > 40) FX_.floats.shift(); }
+function toast(t) { FX_.toast = { t: 0, text: t }; }
+
+// ---------- main loop ----------
+let lastT = performance.now();
+const QL = { lvl: 0, trail: 6, acc: 0, n: 0, cool: 0 }; // adaptive quality governor
+function governor(dt) {
+  QL.acc += dt; QL.n++; QL.cool -= dt; if (QL.acc < 1) return; const fps = QL.n / QL.acc; QL.acc = 0; QL.n = 0;
+  if (fps < 48 && QL.cool <= 0 && QL.lvl < 3) { QL.lvl++; QL.cool = 2; applyQL(); }
+  else if (fps > 58.5 && QL.cool <= -6 && QL.lvl > 0 && !pack) { QL.lvl--; QL.cool = 2; applyQL(); }
+}
+function applyQL() { QL.trail = [6, 4, 2, 0][QL.lvl]; const cap = [2.5, 2.5, 1.75, 1.25][QL.lvl]; if (Math.min(window.devicePixelRatio || 1, cap) !== DPR) { DPRCAP = cap; resize(true); } }
+let DPRCAP = 2.5;
+function frame(now) {
+  requestAnimationFrame(frame);
+  let dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
+  governor(dt); update(dt); draw(now / 1000);
+}
+function update(dt) {
+  // wheel
+  if (pack) { pack.t += dt * pack.speed; advancePack(pack.t, false); wheel.theta = wheelAngle(Math.max(0, pack.t));
+    const allEnded = pack.p.flights.every(f => f.ended) && FX_.flyers.length === 0;
+    if (allEnded && pack.t >= pack.p.tEnd + 0.35) { if (pack.onDone) pack.onDone(); else if (pack.ctx.kind === 'base') finishPackBase(); else finishPackBonus(); }
+  } else wheel.theta += wheel.omega * dt;
+  // flyers (booth wisps rising to their sign)
+  for (let i = FX_.flyers.length - 1; i >= 0; i--) { const fl = FX_.flyers[i]; fl.t += dt * (PARAM.turbo ? 1.8 : 1); if (fl.t >= fl.dur) { FX_.flyers.splice(i, 1); if (fl.isTrig) { signFill[fl.si] = 1; signFlash(fl.si); FX_.shake = 0.25; tone(1047, 0.3, 'square', 0.05); } else signFill[fl.si] = Math.min(0.9, signFill[fl.si] + 0.06 + Math.random() * 0.05); spark(fl.x1, fl.y1, 10); } }
+  // particles
+  for (let i = FX_.sparks.length - 1; i >= 0; i--) { const s = FX_.sparks[i]; s.t += dt; if (s.t >= s.d) { FX_.sparks.splice(i, 1); continue; } s.x += s.vx * dt; s.y += s.vy * dt; s.vy += (s.g || 60) * dt; if (s.rot !== undefined) s.rot += dt * 5; }
+  for (let i = FX_.floats.length - 1; i >= 0; i--) { const f = FX_.floats[i]; f.t += dt; if (f.t > 1.1) FX_.floats.splice(i, 1); }
+  for (let i = FX_.bursts.length - 1; i >= 0; i--) { const b = FX_.bursts[i]; b.t += dt; if (b.t > 0.45) FX_.bursts.splice(i, 1); }
+  if (FX_.banner) FX_.banner.t += dt; if (FX_.celeb) FX_.celeb.t += dt; if (FX_.toast) { FX_.toast.t += dt; if (FX_.toast.t > 2) FX_.toast = null; }
+  if (FX_.jpHi) { FX_.jpHi.t += dt; if (FX_.jpHi.t > 4) FX_.jpHi = null; }
+  if (FX_.signFlash) for (let i = 0; i < 3; i++) FX_.signFlash[i] = Math.max(0, FX_.signFlash[i] - dt * 0.8);
+  FX_.sweep = Math.max(0, FX_.sweep - dt * 0.7); FX_.shake = Math.max(0, FX_.shake - dt);
+  if (doors) for (const k in doors.anim) doors.anim[k] = Math.min(1, doors.anim[k] + dt * 2.5);
+  if (crypt) for (const k in crypt.pop) { crypt.pop[k] += dt; if (crypt.pop[k] > 0.6) delete crypt.pop[k]; }
+  // timed steps
+  if (seq.length) { const s = seq[0]; s.t += dt; if (s.upd) s.upd(s, dt); if (s.skip || s.t >= s.dur) { seq.shift(); s.end(); } }
+  if (PARAM.debug && Math.random() < 0.1) debugPanel();
+}
+
+// ---------- drawing ----------
+function railPos(u, x0) { // u 0..1 along: up the right rail, around the top-right arc, left along the top rail to x0
+  const L1 = 400, L2 = Math.PI / 2 * 28, L3 = Math.max(0, 310 - x0), Lt = L1 + L2 + L3; const e = 1 - Math.pow(1 - u, 1.7); let d = e * Lt;
+  if (d < L1) return [338, 440 - d]; d -= L1; if (d < L2) { const a = d / 28; return [310 + Math.cos(a) * 28, 40 - Math.sin(a) * 28]; } d -= L2; return [310 - d, G.START_Y];
+}
+function posAt(f, t) { // interpolate recorded trajectory
+  const P2 = f.pts, n = P2.length / 3; if (t <= P2[0]) return [P2[1], P2[2]]; if (t >= P2[(n - 1) * 3]) return [P2[(n - 1) * 3 + 1], P2[(n - 1) * 3 + 2]];
+  let lo = 0, hi = n - 1; while (hi - lo > 1) { const m = (lo + hi) >> 1; if (P2[m * 3] <= t) lo = m; else hi = m; }
+  const t0 = P2[lo * 3], t1 = P2[hi * 3], u = t1 > t0 ? (t - t0) / (t1 - t0) : 0; return [P2[lo * 3 + 1] + (P2[hi * 3 + 1] - P2[lo * 3 + 1]) * u, P2[lo * 3 + 2] + (P2[hi * 3 + 2] - P2[lo * 3 + 2]) * u];
+}
+function wispPos(f, t) { // field coords or null
+  if (f.rail && t < f.t0) { if (t < f.rail.launch) return null; const u = (t - f.rail.launch) / (f.t0 - f.rail.launch); return railPos(Math.max(0, Math.min(1, u)), f.rail.x0); }
+  if (t < f.t0) return null; return posAt(f, t);
+}
+function draw(time) {
+  if (!bgc) return;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  let sx = 0, sy = 0; if (FX_.shake > 0) { sx = (Math.random() - 0.5) * FX_.shake * 10 * K; sy = (Math.random() - 0.5) * FX_.shake * 8 * K; }
+  const shk = (sx || sy) ? 'translate(' + (sx / DPR).toFixed(1) + 'px,' + (sy / DPR).toFixed(1) + 'px)' : ''; if (shk !== draw.shk) { cvbg.style.transform = cv.style.transform = shk; draw.shk = shk; } sx = sy = 0;
+  ctx.clearRect(0, 0, CW, CH);
+  ctx.setTransform(K, 0, 0, K, OX + sx, OY + sy);
+  if (!SKIP.drawSigns) drawSigns(time);
+  // field dynamic
+  ctx.save(); ctx.translate(FX, FY);
+  if (!SKIP.drawCandles) drawCandles(time);
+  if (!SKIP.drawWheel) drawWheel(time);
+  if (pumpsVis) for (const q of pumpsVis) if (!q.gone) { const w = 1 + Math.sin(time * 4 + q.x) * 0.04; ctx.drawImage(SPR.pumpkin, q.x - 11 * w, q.y - 11 * w, 22 * w, 22 * w); }
+  if (!SKIP.drawSlotsDyn) drawSlotsDyn(time);
+  if (!SKIP.drawWisps) drawWisps(time);
+  ctx.restore();
+  // bursts
+  ctx.globalCompositeOperation = 'lighter';
+  for (const b of FX_.bursts) { const u = b.t / 0.45; ctx.globalAlpha = 1 - u; const r = 10 + Math.round(u * 15) * 2; dGL(GL('orange', r * 2, r * 2), b.x - r, b.y - r, r * 2, r * 2); }
+  I0(); for (const s of FX_.sparks) { if (s.spr === 'coin') continue; const u = s.t / s.d; ctx.globalAlpha = 1 - u; if (s.gen !== GLGEN) { const r = Math.round(s.s * 2) / 2; s.cv = GL(s.spr, r * 2, r * 2); s.gen = GLGEN; } blitSC(s.cv, s.x, s.y); } IS();
+  // flyers
+  for (const fl of FX_.flyers) { const u = Math.min(1, fl.t / fl.dur), e = u * u * (3 - 2 * u); const cx = (fl.x0 + fl.x1) / 2 + (fl.si - 1) * 40, cy = Math.min(fl.y0, fl.y1) + 60; const x = (1 - e) * (1 - e) * fl.x0 + 2 * (1 - e) * e * cx + e * e * fl.x1, y = (1 - e) * (1 - e) * fl.y0 + 2 * (1 - e) * e * cy + e * e * fl.y1; ctx.globalAlpha = 1; const spr = fl.col === 'train' ? SPR.teal : fl.col === 'crypt' ? SPR.gold : SPR.orange; ctx.drawImage(spr, x - 12, y - 12, 24, 24); ctx.drawImage(SPR.wisp, x - 9, y - 9, 18, 18); }
+  if (FX_.sweep > 0) { const u = 1 - FX_.sweep; const x = -80 + u * (STW + 160); if (!SPR.sweepC || SPR.sweepC._g !== GLGEN) { const c = document.createElement('canvas'); c.width = Math.ceil(140 * K); c.height = 8; const g = c.getContext('2d'); const gr = g.createLinearGradient(0, 0, c.width, 0); gr.addColorStop(0, 'rgba(255,170,60,0)'); gr.addColorStop(0.5, 'rgba(255,200,120,0.35)'); gr.addColorStop(1, 'rgba(255,170,60,0)'); g.fillStyle = gr; g.fillRect(0, 0, c.width, 8); c._g = GLGEN; SPR.sweepC = c; } ctx.globalAlpha = 1; I0(); ctx.drawImage(SPR.sweepC, Math.round(OX + (x - 70) * K), OY, SPR.sweepC.width, Math.round(STH * K)); IS(); }
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  for (const s of FX_.sparks) if (s.spr === 'coin') { ctx.save(); ctx.translate(s.x, s.y); ctx.scale(Math.abs(Math.cos(s.rot)) * 0.9 + 0.1, 1); ctx.drawImage(SPR.coin, -s.s, -s.s, s.s * 2, s.s * 2); ctx.restore(); }
+  // jackpot plush highlight
+  if (FX_.jpHi) { const p = PLUSH.find(q => q.lv === FX_.jpHi.lv); const tt = FX_.jpHi.t; const lift = Math.abs(Math.sin(tt * 6)) * 6 * Math.max(0, 1 - tt / 4); ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.6 + 0.4 * Math.sin(tt * 8); dGL(GL(JP_GLOW[p.lv], 100, 100), p.x - 50, STH - 12 - p.h / 2 - 50, 100, 100); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; drawPlush(ctx, p, 1.08, lift); }
+  // floaters
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const f of FX_.floats) { const u = f.t / 1.1; ctx.globalAlpha = u < 0.75 ? 1 : 1 - (u - 0.75) / 0.25; const y = f.y - u * 22; txt(f.text, f.size, 'Bangers', f.col, 'rgba(10,0,20,0.85)', 2.5, f.x, y, 'center'); }
+  ctx.globalAlpha = 1;
+  if (!SKIP.drawHUD) drawHUD(time);
+  if (FX_.banner) drawBanner(FX_.banner, time);
+  if (FX_.celeb) drawCeleb(FX_.celeb, time);
+  if (mode === 'idle' && !FX_.celeb) { ctx.globalAlpha = 0.6 + 0.4 * Math.sin(time * 3); ctx.font = '15px Bangers'; ctx.fillStyle = '#d6ffb0'; ctx.strokeStyle = 'rgba(10,0,20,0.9)'; ctx.lineWidth = 3; const t = 'TAP TO RELEASE 10 WISPS'; ctx.strokeText(t, FX + 165, FY + 100); ctx.fillText(t, FX + 165, FY + 100); ctx.globalAlpha = 1; }
+  if (FX_.toast) { ctx.globalAlpha = Math.min(1, (2 - FX_.toast.t) * 2); ctx.fillStyle = 'rgba(20,8,40,0.9)'; rr(ctx, 86, 300, 200, 30, 12); ctx.fill(); ctx.fillStyle = '#ffe2a8'; ctx.font = '14px Bangers'; ctx.fillText(FX_.toast.text, 186, 315); ctx.globalAlpha = 1; }
+}
+function drawSigns(time) {
+  for (let i = 0; i < 3; i++) {
+    const k = SIGN_KEYS[i], sp = SPR.signs[k]; if (!sp) continue; const dim = sp.dim, lit = sp.lit;
+    const h = SIGN_H, w = sp.lit.uw, x = SIGN_X[i] - w / 2, y = SIGN_Y;
+    const fill = signFill[i], fl = FX_.signFlash ? FX_.signFlash[i] : 0;
+    const on = (bonusRun && bonusRun.set.includes(k)) ? 1 : 0;
+    let a = 0.08 + 0.8 * Math.min(1, fill); if (fill < 1) a *= 0.9 + 0.1 * Math.sin(time * (7 + i) + i * 2); a = Math.max(a, on * (0.85 + 0.15 * Math.sin(time * 5)));
+    I0(); blitS(signC(k, Math.min(1, a)), x, y); IS();
+    if (fl > 0 || (on && QL.lvl === 0)) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = Math.min(1, fl * 0.9 + on * 0.18); I0(); blitS(lit, x, y); IS(); if (fl > 0) { const spr = GL(k === 'train' ? 'teal' : k === 'crypt' ? 'gold' : 'orange', w * 1.6, h + 20); ctx.globalAlpha = Math.min(1, fl); dGL(spr, SIGN_X[i] - w * 0.8, y - 10, w * 1.6, h + 20); } ctx.globalCompositeOperation = 'source-over'; }
+    ctx.globalAlpha = 1;
+    // fill gauge (bulbs under the sign)
+    const nb = 7; for (let b = 0; b < nb; b++) { const bx = SIGN_X[i] - 21 + b * 7, by = y + h + 1.5; const lit2 = (b + 0.5) / nb <= fill; ctx.fillStyle = lit2 ? BOOTH_COL[k] : 'rgba(80,60,100,0.8)'; ctx.beginPath(); ctx.arc(bx, by, 1.8, 0, 7); ctx.fill(); }
+  }
+}
+const CANDLES = P.nails.filter((n, i) => (i * 7) % 9 === 0 && n.row > 0).slice(0, 18);
+function drawCandles(time) {
+  for (const n of CANDLES) { if (pumpsVis && pumpsVis.some(q => !q.gone && q.x === n.x && q.y === n.y)) continue; ctx.fillStyle = '#efe2c4'; ctx.fillRect(n.x - 1.3, n.y - 7, 2.6, 5); }
+  ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < CANDLES.length; i++) { const n = CANDLES[i]; if (pumpsVis && pumpsVis.some(q => !q.gone && q.x === n.x && q.y === n.y)) continue; const f = 0.8 + 0.2 * Math.sin(time * 13 + i * 1.7) + 0.1 * Math.sin(time * 31 + i); ctx.globalAlpha = 0.9; const r = 4.2 * f; ctx.drawImage(SPR.flame, n.x - r, n.y - 9 - r * 1.1, r * 2, r * 2.2); }
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+}
+function drawWheel(time) {
+  const th = wheel.theta; const cx = G.WX, cy = G.WY;
+  // gate
+  const gx = cx, gy = G.GATE_Y;
+  if (wheel.gateOpen) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.55 + 0.35 * Math.sin(time * 6); ctx.drawImage(SPR.purple, gx - 18, gy - 18, 36, 36); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; }
+  ctx.strokeStyle = wheel.gateOpen ? '#e2b8ff' : '#7a5aa0'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(gx, gy + 2, 9, Math.PI * 1.05, Math.PI * 1.95); ctx.stroke();
+  ctx.fillStyle = wheel.gateOpen ? 'rgba(20,0,40,0.6)' : '#4b2a7a'; ctx.beginPath(); ctx.arc(gx, gy + 2, 7.5, Math.PI, 0); ctx.fill();
+  ctx.font = '8px Bangers'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = wheel.gateOpen ? '#ffffff' : '#a48cc8'; ctx.fillText(wheel.gateOpen ? 'V' : '✕'.replace('✕', 'x'), gx, gy - 1);
+  // rim
+  I0(); blitFC(rimFrame(th), cx, cy); IF();
+  // cabins (upright)
+  const ride = wheel.ride; const t = pack ? pack.t : 0;
+  for (let c = 0; c < 8; c++) {
+    const a = th + c * Math.PI / 4, px = cx + Math.cos(a) * 39, py = cy + Math.sin(a) * 39; const lv = C.CABINS[c];
+    const spr = c === 0 ? SPR.cabinV : SPR.cabin; if (!spr) continue;
+    const active = ride && ride.cabin === c && t >= ride.tc && t < ride.te + 0.3;
+    if (active || (lv === 'grand')) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = active ? 0.8 + 0.2 * Math.sin(time * 10) : 0.35; ctx.drawImage(SPR[JP_GLOW[lv]], px - 16, py - 6, 32, 32); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; }
+    I0(); blitF(spr, px - spr.uw / 2, py - 3); IF();
+    if (c !== 0) { ctx.fillStyle = JP_COL[lv]; ctx.beginPath(); ctx.arc(px, py + spr.uh - 6, 2.4, 0, 7); ctx.fill(); }
+    if (active && ride.revealed) { ctx.font = '8px Bangers'; ctx.fillStyle = JP_COL[lv]; ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.strokeText(lv.toUpperCase(), px, py - 8); ctx.fillText(lv.toUpperCase(), px, py - 8); }
+  }
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(th * 0.5); if (SPR.hub) ctx.drawImage(SPR.hub, -10, -10, 20, 20); ctx.restore();
+}
+function cabinPos(c) { const a = wheel.theta + c * Math.PI / 4; return [G.WX + Math.cos(a) * 39, G.WY + Math.sin(a) * 39 + 10]; }
+function drawSlotsDyn(time) {
+  if (doors) for (const s of doors.list) {
+    const x = s * 30, im = A.slot_door; const open = doors.open.has(s), an = open ? (doors.anim[s] || 0) : 0;
+    if (open) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.45 + 0.2 * Math.sin(time * 5 + s); ctx.drawImage(SPR.teal, x - 8, 362, 46, 60); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; }
+    if (im && an < 1) { const hh = 56, ww = hh * im.width / im.height; ctx.save(); ctx.translate(x + 2, 0); ctx.scale(1 - an * 0.85, 1); ctx.globalAlpha = 1 - an * 0.3; ctx.drawImage(im, 0, 421 - hh, Math.min(26, ww), hh); ctx.restore(); ctx.globalAlpha = 1; }
+    ctx.fillStyle = '#120722'; ctx.fillRect(x + 1, 422, 28, 13); ctx.font = (open ? 12 : 9) + 'px Bangers'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = open ? '#38f3e0' : '#5aa59e'; ctx.fillText(open ? '×' + C.DOOR_V : 'DOOR', x + 15, 429);
+  }
+  if (crypt) {
+    ctx.fillStyle = 'rgba(30,18,6,0.55)'; ctx.fillRect(0, 360, 330, 61);
+    for (let s = 0; s < 11; s++) { const x = s * 30 + 15, v = crypt.cells[s]; ctx.strokeStyle = 'rgba(255,207,58,0.45)'; ctx.lineWidth = 1; ctx.strokeRect(s * 30 + 2.5, 363, 25, 56);
+      if (v > 0) { const p = crypt.pop[s]; const sc = p !== undefined ? 1 + 0.35 * Math.sin(Math.min(1, p / 0.6) * Math.PI) : 1; const r = 12 * sc; ctx.drawImage(SPR.coin, x - r, 392 - r, r * 2, r * 2); const txt = v >= 1000 ? (v / 1000).toFixed(v % 1000 ? 1 : 0) + 'K' : fmt(v); ctx.font = (txt.length > 3 ? 8.5 : 10) * sc + 'px Bangers'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#3a1d00'; ctx.fillText(txt, x, 392.5); } }
+    // respins lanterns
+    if (!crypt.done) for (let i = 0; i < 3; i++) { const lx = 135 + i * 30, ly = 352; const on = i < crypt.respins; ctx.globalCompositeOperation = on ? 'lighter' : 'source-over'; ctx.globalAlpha = on ? 0.9 : 0.5; ctx.drawImage(on ? SPR.gold : SPR.purple, lx - 8, ly - 8, 16, 16); ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1; }
+  }
+}
+function drawWisps(time) {
+  if (!pack) return; const t = pack.t, p = pack.p;
+  ctx.globalCompositeOperation = 'lighter';
+  const dbg = PARAM.debug && !PARAM.blind;
+  let onB = 0; for (const f of p.flights) if (t >= f.t0 && t <= f.t1) onB++; const TRN0 = onB > 20 ? Math.min(QL.trail, 2) : onB > 12 ? Math.min(QL.trail, 3) : onB > 6 ? Math.min(QL.trail, 4) : QL.trail; const TRN = TRN0; const TRC = []; for (let j = 1; j <= TRN; j++) { const r = 6 * (1 - j / (TRN + 3)); TRC[j] = GL('trail', r * 2, r * 2); } I0();
+  for (const f of p.flights) {
+    let pos = null, golden = pack.ctx.golden;
+    const ride = wheel.ride;
+    if (f.kind === 'gate' && ride && ride.f === f && t >= f.t1 && t < ride.te) { // riding the wheel
+      const u = Math.min(1, (t - f.t1) / 0.3); const cp = cabinPos(ride.cabin); const gx = G.WX, gy = G.GATE_Y; pos = [gx + (cp[0] - gx) * u, gy + (cp[1] - gy) * u];
+    } else if (t <= f.t1 + 0.001) pos = wispPos(f, t);
+    else if (f.kind === 'slot' || f.kind === 'exit') { const dt2 = t - f.t1; if (dt2 < 0.3) { const e = posAt(f, f.t1); ctx.globalAlpha = 1 - dt2 / 0.3; const r = Math.max(1, Math.round(9 * (1 - dt2 / 0.3))); blitFC(GL(golden ? 'wispGold' : 'wisp', r * 2, r * 2), e[0], e[1] + dt2 * 40); ctx.globalAlpha = 1; } continue; }
+    if (!pos) continue;
+    // trail
+    if (t > f.t0 && TRN) for (let j = TRN; j >= 1; j--) { const tt = t - j * 0.022; if (tt < f.t0) continue; const q = posAt(f, tt); ctx.globalAlpha = 0.5 * (1 - j / (TRN + 1)); blitFC(TRC[j], q[0], q[1]); }
+    ctx.globalAlpha = 1; const r = 10 + Math.round(Math.sin(time * 20 + f.t0 * 10) * 2) * 0.4;
+    blitFC(GL(golden ? 'wispGold' : 'wisp', r * 2, r * 2), pos[0], pos[1]);
+    if (dbg && f.entry >= 0 && f.kind !== 'break') { IF(); ctx.globalCompositeOperation = 'source-over'; const tgt = pack.spec.wisps[f.entry] ? pack.spec.wisps[f.entry].slot : f.landed; ctx.font = '8px monospace'; ctx.fillStyle = f.method === 'main' ? '#9f9' : f.method === 'fallback' ? '#fc6' : f.method === 'pure' ? '#fff' : '#f66'; ctx.fillText((f.kind === 'gate' ? 'V' : tgt) + (f.method === 'main' ? '' : f.method[0]), pos[0], pos[1] - 9); ctx.globalCompositeOperation = 'lighter'; I0(); }
+    if (dbg && f.kind === 'break') { IF(); ctx.globalCompositeOperation = 'source-over'; ctx.font = '8px monospace'; ctx.fillStyle = '#fb5'; ctx.fillText('P', pos[0], pos[1] - 9); ctx.globalCompositeOperation = 'lighter'; I0(); }
+  }
+  IF(); ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+  // launcher queue: wisps waiting at the bottom of the rail
+  const waiting = pack.queue.filter(l => l > t).length; for (let i = 0; i < waiting; i++) { ctx.globalCompositeOperation = 'lighter'; ctx.drawImage(SPR.wisp, 338 - 5, 428 - i * 9 - 5, 10, 10); } ctx.globalCompositeOperation = 'source-over';
+}
+function FX0(x) { return x; }
+function drawHUD(time) {
+  if (pack && pack.ctx.kind === 'base' || (mode === 'base' && pack)) { const v = pack.sum; if (v > 0) txt('PACK ' + fmt(v), 13, 'Bangers', '#d6ffb0', 'rgba(10,0,20,0.9)', 3, FX + 165, FY + 340, 'center'); }
+  if (bonusRun) {
+    const br = bonusRun; const bt = bonusTitle(br.set);
+    ctx.fillStyle = 'rgba(16,6,34,0.88)'; rr(ctx, 40, 106, 292, 22, 11); ctx.fill(); ctx.strokeStyle = bt.col; ctx.lineWidth = 1; ctx.stroke();
+    ctx.font = '12px Bangers'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillStyle = bt.col;
+    let left = br.set.length === 3 ? 'MIDNIGHT' : br.set.map(k => BONUS_INFO[k].name.split(' ')[1] === 'TRAIN' ? 'FEVER' : k === 'crypt' ? 'HOLD & DROP' : 'MULTIBALL').join(' + ');
+    txt(left, 12, 'Bangers', bt.col, '', 0, 52, 117.5, 'left');
+    const packsTotal = br.packsTotal || 0; const shown = Math.min(br.i + (pack ? 1 : 0), Math.max(packsTotal, br.i + 1));
+    let mid = packsTotal ? 'PACK ' + shown + '/' + Math.max(packsTotal, shown) : 'RESPINS ' + (crypt ? crypt.respins : 0);
+    txt(mid, 12, 'Bangers', '#f4e9ff', '', 0, 196, 117.5, 'center');
+    const cur = br.total + (pack ? pack.sum : 0) + (crypt ? crypt.cells.reduce((a, b) => a + b, 0) : 0);
+    txt('WIN ' + fmt(cur), 12, 'Bangers', '#d6ffb0', '', 0, 322, 117.5, 'right');
+  }
+}
+function bannerCanvas(b) { // whole banner pre-rendered at device scale (re-rendered only when the banner or the scale changes)
+  if (b._c && b._g === GLGEN) return b._c; const W = 350, H = 140; const c = document.createElement('canvas'); c.width = Math.ceil(W * K); c.height = Math.ceil(H * K); const g = c.getContext('2d'); g.scale(K, K); g.translate(W / 2, H / 2);
+  g.globalCompositeOperation = 'lighter'; g.globalAlpha = 0.25; g.drawImage(GL(b.col === '#38f3e0' ? 'teal' : b.col === '#ffcf3a' ? 'gold' : b.col === '#ff8a1f' ? 'orange' : 'purple', 350, 140), -175, -70, 350, 140); g.globalCompositeOperation = 'source-over'; g.globalAlpha = 1;
+  g.fillStyle = 'rgba(14,4,30,0.85)'; rr(g, -165, -46, 330, 92, 18); g.fill(); g.strokeStyle = b.col; g.lineWidth = 2; g.stroke();
+  g.textAlign = 'center'; g.textBaseline = 'middle'; g.lineJoin = 'round';
+  const title = b.title; let fs = b.jp ? 30 : 34; g.font = fs + 'px Creepster'; while (g.measureText(title).width > 300 && fs > 14) { fs -= 2; g.font = fs + 'px Creepster'; }
+  g.lineWidth = 4; g.strokeStyle = 'rgba(0,0,0,0.9)'; g.strokeText(title, 0, -12); g.fillStyle = b.col; g.fillText(title, 0, -12);
+  g.font = (b.jp ? 26 : 12) + 'px Bangers'; g.fillStyle = b.jp ? '#fff3c8' : '#f4e9ff'; g.lineWidth = 3; g.strokeText(b.sub, 0, 24); g.fillText(b.sub, 0, 24);
+  b._c = c; b._g = GLGEN; return c;
+}
+function drawBanner(b, time) {
+  const u = Math.min(1, b.t / 0.25), out = b.dur - b.t < 0.3 ? Math.max(0, (b.dur - b.t) / 0.3) : 1; const sc = (0.6 + 0.4 * (1 - Math.pow(1 - u, 3))) * out;
+  const c = bannerCanvas(b); ctx.globalAlpha = out;
+  if (sc >= 0.999) { I0(); blitSC(c, STW / 2, FY + 175); IS(); }
+  else ctx.drawImage(c, STW / 2 - 175 * sc, FY + 175 - 70 * sc, 350 * sc, 140 * sc);
+  ctx.globalAlpha = 1;
+}
+function drawCeleb(c, time) {
+  const u = Math.min(1, c.t / Math.max(0.6, c.dur * 0.55)), e = 1 - Math.pow(1 - u, 3); const v = c.v * e; const out = c.dur - c.t < 0.35 ? Math.max(0, (c.dur - c.t) / 0.35) : 1;
+  const big = c.kind !== 'win'; const title = c.title || (c.kind === 'big' ? 'BIG WIN' : c.kind === 'jackpot' ? 'JACKPOT' : 'WIN');
+  ctx.save(); ctx.globalAlpha = out;
+  if (big) { ctx.fillStyle = 'rgba(8,2,20,0.45)'; ctx.fillRect(0, FY + 60, STW, 260); }
+  ctx.translate(STW / 2, FY + 190); const pop = 1 + 0.06 * Math.sin(Math.min(1, c.t / 0.3) * Math.PI);
+  ctx.scale(pop, pop); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if (big) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.5 * out; dGL(GL('gold', 300, 240), -150, -120, 300, 240); ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = out; }
+  let fs = big ? 38 : 26; ctx.font = fs + 'px Creepster'; while (ctx.measureText(title).width > 330 && fs > 16) { fs -= 2; ctx.font = fs + 'px Creepster'; }
+  ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(20,0,10,0.95)'; ctx.strokeText(title, 0, -26); const gr = ctx.createLinearGradient(0, -46, 0, -6); gr.addColorStop(0, '#fff2b0'); gr.addColorStop(0.5, '#ffb43a'); gr.addColorStop(1, '#ff6a1a'); ctx.fillStyle = gr; ctx.fillText(title, 0, -26);
+  ctx.font = (big ? 44 : 32) + 'px Bangers'; ctx.lineWidth = 5; ctx.strokeText(fmt(v), 0, 18); ctx.fillStyle = '#d6ffb0'; ctx.fillText(fmt(v), 0, 18);
+  ctx.restore();
+}
+function debugPanel() {
+  const el = document.getElementById('dbg'); if (PARAM.blind) { el.style.display = 'none'; return; } el.style.display = 'block';
+  const m = stats.methods, tot = m.main + m.fallback + m.corrector || 1;
+  el.textContent = `games ${stats.games} packs ${stats.packs} wisps ${stats.wisps}\nmain ${m.main} fallback ${m.fallback} corrector ${m.corrector}\nlast plan ${stats.lastPlanMs.toFixed(1)} ms ${worker ? '(worker)' : '(main thread)'}\navg candidates/wisp ${(stats.cand / Math.max(1, stats.wisps)).toFixed(1)}\nlabels: target slot, f=fallback c=corrector, V=gate, P=pumpkin`;
+}
+
+// ---------- test hooks ----------
+window.__QL = () => QL; window.__A = A; window.__SPR = SPR; window.__mf = { get mode() { return mode; }, get bal() { return bal; }, get lastWin() { return lastWin; }, get game() { return game; }, get stats() { return stats; }, get pack() { return pack; }, get bonus() { return bonusRun; }, get fx() { return FX_; }, get seqName() { return seq.length ? (seq[0].name || seq[0].dur) : null; }, tap() { if (mode === 'idle') startGame(); else skip(); } };
+
+// ---------- boot ----------
+Promise.all([loadAssets(), document.fonts && document.fonts.load ? Promise.all([document.fonts.load('20px Bangers'), document.fonts.load('20px Creepster')]).catch(() => { }) : Promise.resolve(), initPlanner()]).then(() => {
+  booted = true; resize(true); topbar(); setMode('idle'); requestAnimationFrame(frame);
+  if (PARAM.recall) { const last = store.get('last', null); if (last) { rng.setState(last.rngState); recallNext = last; toast('RECALL: TAP TO REPLAY LAST GAME'); } }
+});
+window.addEventListener('resize', () => { resize(); });
+})();
+
+</script>
+</body>
+</html>
