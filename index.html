@@ -1276,6 +1276,9 @@ function rimFrame(th) { const P4 = Math.PI / 4; let a = th % P4; if (a < 0) a +=
 const SGC = {}; // sign composites (dim + lit at quantized alpha)
 function signC(k, a) { const q = Math.max(0, Math.min(16, Math.round(a * 16))); const key = k + q; let c = SGC[key];
   if (!c) { const sp = SPR.signs[k]; c = document.createElement('canvas'); c.width = sp.dim.width; c.height = sp.dim.height; const g2 = c.getContext('2d'); g2.drawImage(sp.dim, 0, 0); g2.globalAlpha = q / 16; g2.drawImage(sp.lit, 0, 0); SGC[key] = c; } return c; }
+function txtF(text, size, fam, fill, stroke, lw, x, y, align) { txt(text, size, fam, fill, stroke, lw, FX + x, FY + y, align); IF(); } // field-coords variant
+function preImg(key, im, w, h) { const W = Math.max(2, Math.round(w * K)), H = Math.max(2, Math.round(h * K)); const k2 = key + W + 'x' + H; let c = GLC.get(k2); if (!c) { c = document.createElement('canvas'); c.width = W; c.height = H; const g2 = c.getContext('2d'); g2.imageSmoothingQuality = 'high'; g2.drawImage(im, 0, 0, W, H); GLC.set(k2, c); } return c; }
+function coinC(label) { const key = 'coin|' + label; let c = GLC.get(key); if (!c) { const S = Math.round(24 * K); c = document.createElement('canvas'); c.width = c.height = S; const g2 = c.getContext('2d'); g2.drawImage(SPR.coin, 0, 0, S, S); g2.font = ((label.length > 3 ? 8.5 : 10) * K) + 'px Bangers'; g2.textAlign = 'center'; g2.textBaseline = 'middle'; g2.fillStyle = '#3a1d00'; g2.fillText(label, S / 2, S / 2 + 0.5 * K); GLC.set(key, c); } return c; }
 function dGL(c, x, y, w, h) { ctx.imageSmoothingEnabled = false; ctx.drawImage(c, x, y, w, h); ctx.imageSmoothingEnabled = true; }
 function makeSprites() {
   GLC.clear(); GLGEN++; TXC.clear(); RIMC.length = 0; for (const k in SGC) delete SGC[k]; const s = K;
@@ -1788,14 +1791,14 @@ function cabinPos(c) { const a = wheel.theta + c * Math.PI / 4; return [G.WX + M
 function drawSlotsDyn(time) {
   if (doors) for (const s of doors.list) {
     const x = s * 30, im = A.slot_door; const open = doors.open.has(s), an = open ? (doors.anim[s] || 0) : 0;
-    if (open) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.45 + 0.2 * Math.sin(time * 5 + s); ctx.drawImage(SPR.teal, x - 8, 362, 46, 60); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; }
-    if (im && an < 1) { const hh = 56, ww = hh * im.width / im.height; ctx.save(); ctx.translate(x + 2, 0); ctx.scale(1 - an * 0.85, 1); ctx.globalAlpha = 1 - an * 0.3; ctx.drawImage(im, 0, 421 - hh, Math.min(26, ww), hh); ctx.restore(); ctx.globalAlpha = 1; }
-    ctx.fillStyle = '#120722'; ctx.fillRect(x + 1, 422, 28, 13); ctx.font = (open ? 12 : 9) + 'px Bangers'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = open ? '#38f3e0' : '#5aa59e'; ctx.fillText(open ? '×' + C.DOOR_V : 'DOOR', x + 15, 429);
+    if (open) { ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.45 + 0.2 * Math.sin(time * 5 + s); dGL(GL('teal', 46, 60), x - 8, 362, 46, 60); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; }
+    if (im && an < 1) { const hh = 56, ww = Math.min(26, hh * im.width / im.height); const dc = preImg('door', im, ww, hh); if (an <= 0) { I0(); blitF(dc, x + 2, 421 - hh); IF(); } else { ctx.save(); ctx.translate(x + 2, 0); ctx.scale(1 - an * 0.85, 1); ctx.globalAlpha = 1 - an * 0.3; ctx.drawImage(dc, 0, 421 - hh, ww, hh); ctx.restore(); ctx.globalAlpha = 1; } }
+    ctx.fillStyle = '#120722'; ctx.fillRect(x + 1, 422, 28, 13); txtF(open ? '×' + C.DOOR_V : 'DOOR', open ? 12 : 9, 'Bangers', open ? '#38f3e0' : '#5aa59e', '', 0, x + 15, 429, 'center');
   }
   if (crypt) {
     ctx.fillStyle = 'rgba(30,18,6,0.55)'; ctx.fillRect(0, 360, 330, 61);
     for (let s = 0; s < 11; s++) { const x = s * 30 + 15, v = crypt.cells[s]; ctx.strokeStyle = 'rgba(255,207,58,0.45)'; ctx.lineWidth = 1; ctx.strokeRect(s * 30 + 2.5, 363, 25, 56);
-      if (v > 0) { const p = crypt.pop[s]; const sc = p !== undefined ? 1 + 0.35 * Math.sin(Math.min(1, p / 0.6) * Math.PI) : 1; const r = 12 * sc; ctx.drawImage(SPR.coin, x - r, 392 - r, r * 2, r * 2); const txt = v >= 1000 ? (v / 1000).toFixed(v % 1000 ? 1 : 0) + 'K' : fmt(v); ctx.font = (txt.length > 3 ? 8.5 : 10) * sc + 'px Bangers'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#3a1d00'; ctx.fillText(txt, x, 392.5); } }
+      if (v > 0) { const p = crypt.pop[s]; const sc = p !== undefined ? 1 + 0.35 * Math.sin(Math.min(1, p / 0.6) * Math.PI) : 1; const r = 12 * sc; const lab = v >= 1000 ? (v / 1000).toFixed(v % 1000 ? 1 : 0) + 'K' : fmt(v); const cc = coinC(lab); if (sc === 1) { I0(); blitFC(cc, x, 392); IF(); } else ctx.drawImage(cc, x - r, 392 - r, r * 2, r * 2); } }
     // respins lanterns
     if (!crypt.done) for (let i = 0; i < 3; i++) { const lx = 135 + i * 30, ly = 352; const on = i < crypt.respins; ctx.globalCompositeOperation = on ? 'lighter' : 'source-over'; ctx.globalAlpha = on ? 0.9 : 0.5; ctx.drawImage(on ? SPR.gold : SPR.purple, lx - 8, ly - 8, 16, 16); ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1; }
   }
