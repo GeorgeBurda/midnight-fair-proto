@@ -45,7 +45,7 @@ const CFG = {
     { t: 'empty', v: 0 }, { t: 'prize', v: 1 }, { t: 'prize', v: 3 }, { t: 'booth', b: 'crypt', v: 1 }, { t: 'prize', v: 20 }],
   // RNG weights per slot (binomial-like: centre frequent, edges rare). Sum = 10000.
   W: [25, 250, 260, 480, 3175, 1400, 3175, 480, 260, 250, 25],
-  // slot weights for a wisp dropping out of the Ferris wheel (it exits low, in the centre)
+  // slot weights for a wisp dropping out of the Ferris wheel (it hops out of a lower-left / lower-right cabin door)
   WEXIT: [0, 0, 400, 1500, 2600, 1000, 2600, 1500, 400, 0, 0],
   // trigger: per game. combos: T, C, P, TC, TP, CP, TCP(=Midnight)
   TRIG_P: 1 / 88,
@@ -329,13 +329,21 @@ TOP.CUM = cum(TOP.BINW); TOP.CUM_PUMP = cum(TOP.BINW_PUMP); let BOARD_PUMP = fal
 function randX0(rng, pump) { const C = (pump === undefined ? BOARD_PUMP : pump) ? TOP.CUM_PUMP : TOP.CUM; const u = rng(); let i = 0; while (i < C.length - 1 && u > C[i]) i++; return TOP.x0 + (i + rng()) * TOP.BW; }
 function randTop(rng, p, pump) { p[0] = randX0(rng, pump); p[1] = TOP.v0 + rng() * (TOP.v1 - TOP.v0); p[2] = rng() * TOP.w1; return p; }
 // 'point': burst / wheel exit: angle (rad, 0 = right, -PI/2 = up) and speed
+// spec.mirror: the start point (and launch cone) is mirrored to the right half of the board when p[2] = 1 (wheel exit: left or right cabin door, 50/50)
 function startState(spec, p, out) {
   if (spec.kind === 'top') { out[0] = p[0]; out[1] = G.START_Y; out[2] = p[1]; out[3] = p[2]; }
-  else { out[0] = spec.x; out[1] = spec.y; out[2] = Math.cos(p[0]) * p[1]; out[3] = Math.sin(p[0]) * p[1]; }
+  else { const m = spec.mirror && p[2] === 1; out[0] = m ? G.FW - spec.x : spec.x; out[1] = spec.y; out[2] = (m ? -1 : 1) * Math.cos(p[0]) * p[1]; out[3] = Math.sin(p[0]) * p[1]; }
   return out;
 }
 function randPoint(rng, spec, p) {
-  const a = spec.a0 + rng() * (spec.a1 - spec.a0), s = spec.s0 + rng() * (spec.s1 - spec.s0); p[0] = a; p[1] = s; return p;
+  const a = spec.a0 + rng() * (spec.a1 - spec.a0), s = spec.s0 + rng() * (spec.s1 - spec.s0); p[0] = a; p[1] = s; if (spec.mirror) p[2] = rng() < 0.5 ? 1 : 0; return p;
+}
+// Ferris-wheel exit (geometry only; slot weights stay CFG.WEXIT): the wisp hops out of its cabin through a door on the lower-left or lower-right
+// of the rim (50/50) with a uniform launch cone. Tuned in tune/wopt.js + wpolish.js so unsteered landings match CFG.WEXIT.
+const WEXIT_GEO = { phi: 141.536, gap: 1.067, a0: 83.84, a1: 162.95, s0: 40.54, s1: 80.99 }; // degrees (screen, y down) for the LEFT door; right door mirrored
+function exitSpec(t0) {
+  const D = Math.PI / 180, r = G.WR + G.R + WEXIT_GEO.gap;
+  return { kind: 'point', mirror: true, x: G.WX + Math.cos(WEXIT_GEO.phi * D) * r, y: G.WY + Math.sin(WEXIT_GEO.phi * D) * r, t0, a0: WEXIT_GEO.a0 * D, a1: WEXIT_GEO.a1 * D, s0: WEXIT_GEO.s0, s1: WEXIT_GEO.s1 };
 }
 
 // ---- bias tables for 'top' starts: start conditions that naturally reach each slot / the gate ----
@@ -470,7 +478,7 @@ function search(rng, spec, t0, target, env, budget, launch, railFn) {
   return { method: 'fail', n, rec: lastRec, out: lastO };
 }
 
-const API = { TOP, G, randTop, randX0, nails, present, sim, search, buildTable, Rec, slotOf, slotCenter, correct, rowX, get TABLE() { return TABLE; }, set TABLE(t) { TABLE = t; } };
+const API = { TOP, G, WEXIT_GEO, exitSpec, randPoint, startState, randTop, randX0, nails, present, sim, search, buildTable, Rec, slotOf, slotCenter, correct, rowX, get TABLE() { return TABLE; }, set TABLE(t) { TABLE = t; } };
 if (typeof module !== 'undefined' && module.exports) module.exports = API; else root.MFPhys = API;
 })(typeof self !== 'undefined' ? self : this);
 
@@ -480,7 +488,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = API; else 
 const P = (typeof module !== 'undefined' && module.exports) ? require('./phys.js') : root.MFPhys;
 const G = P.G;
 const RIDE = 2.6;              // seconds a wisp spends in the wheel (settle + half-turn + reveal)
-const EXIT = { x: G.WX, y: G.WY + G.WR + 7 };
+const EXIT = P.exitSpec(0); // left cabin door; the right door is its mirror (spec.mirror)
 function railTime(x0) { return 0.38 + (G.FW - x0) / 700; } // up the right rail + along the top rail to x0
 
 // candidate pumpkin positions: lattice nails in rows 1..8 away from the wheel and walls
@@ -592,7 +600,7 @@ function tryPlan(spec, rng) {
     const r = flySeg(rng, gateSeg, { gate: true }, env, 900); note(r);
     if (r.out.code !== -3) return null;
     const f = mkFlight(gateSeg, r, gateEntry, 'gate'); f.ride = { tc: r.out.t, te: r.out.t + RIDE, level: spec.wisps[gateEntry].gate }; flights.push(f);
-    const ex = { kind: 'point', x: EXIT.x, y: EXIT.y, t0: r.out.t + RIDE, a0: Math.PI * 0.06, a1: Math.PI * 0.94, s0: 20, s1: 260 };
+    const ex = P.exitSpec(r.out.t + RIDE);
     const r2 = flySeg(rng, ex, { slot: spec.wisps[gateEntry].slot }, env, 900); note(r2);
     flights.push(mkFlight(ex, r2, gateEntry, 'exit'));
   }
@@ -608,7 +616,7 @@ function flySeg(rng, seg, target, env, budget) {
     const r = P.search(rng, { kind: 'top' }, 0, target, env, budget, seg.launch, railTime);
     return r;
   }
-  return P.search(rng, { kind: 'point', x: seg.x, y: seg.y, a0: seg.a0, a1: seg.a1, s0: seg.s0, s1: seg.s1 }, seg.t0, target, env, budget);
+  return P.search(rng, { kind: 'point', x: seg.x, y: seg.y, a0: seg.a0, a1: seg.a1, s0: seg.s0, s1: seg.s1, mirror: seg.mirror }, seg.t0, target, env, budget);
 }
 function mkFlight(seg, r, entry, kind) {
   const pts = r.rec.pts; const f = { entry, kind, method: r.method, t0: pts[0], t1: pts[pts.length - 3], pts: Float32Array.from(pts), imps: Float32Array.from(r.rec.imps), init: !!seg.init, idx: seg.idx };
@@ -667,7 +675,7 @@ const CFG = {
     { t: 'empty', v: 0 }, { t: 'prize', v: 1 }, { t: 'prize', v: 3 }, { t: 'booth', b: 'crypt', v: 1 }, { t: 'prize', v: 20 }],
   // RNG weights per slot (binomial-like: centre frequent, edges rare). Sum = 10000.
   W: [25, 250, 260, 480, 3175, 1400, 3175, 480, 260, 250, 25],
-  // slot weights for a wisp dropping out of the Ferris wheel (it exits low, in the centre)
+  // slot weights for a wisp dropping out of the Ferris wheel (it hops out of a lower-left / lower-right cabin door)
   WEXIT: [0, 0, 400, 1500, 2600, 1000, 2600, 1500, 400, 0, 0],
   // trigger: per game. combos: T, C, P, TC, TP, CP, TCP(=Midnight)
   TRIG_P: 1 / 88,
@@ -951,13 +959,21 @@ TOP.CUM = cum(TOP.BINW); TOP.CUM_PUMP = cum(TOP.BINW_PUMP); let BOARD_PUMP = fal
 function randX0(rng, pump) { const C = (pump === undefined ? BOARD_PUMP : pump) ? TOP.CUM_PUMP : TOP.CUM; const u = rng(); let i = 0; while (i < C.length - 1 && u > C[i]) i++; return TOP.x0 + (i + rng()) * TOP.BW; }
 function randTop(rng, p, pump) { p[0] = randX0(rng, pump); p[1] = TOP.v0 + rng() * (TOP.v1 - TOP.v0); p[2] = rng() * TOP.w1; return p; }
 // 'point': burst / wheel exit: angle (rad, 0 = right, -PI/2 = up) and speed
+// spec.mirror: the start point (and launch cone) is mirrored to the right half of the board when p[2] = 1 (wheel exit: left or right cabin door, 50/50)
 function startState(spec, p, out) {
   if (spec.kind === 'top') { out[0] = p[0]; out[1] = G.START_Y; out[2] = p[1]; out[3] = p[2]; }
-  else { out[0] = spec.x; out[1] = spec.y; out[2] = Math.cos(p[0]) * p[1]; out[3] = Math.sin(p[0]) * p[1]; }
+  else { const m = spec.mirror && p[2] === 1; out[0] = m ? G.FW - spec.x : spec.x; out[1] = spec.y; out[2] = (m ? -1 : 1) * Math.cos(p[0]) * p[1]; out[3] = Math.sin(p[0]) * p[1]; }
   return out;
 }
 function randPoint(rng, spec, p) {
-  const a = spec.a0 + rng() * (spec.a1 - spec.a0), s = spec.s0 + rng() * (spec.s1 - spec.s0); p[0] = a; p[1] = s; return p;
+  const a = spec.a0 + rng() * (spec.a1 - spec.a0), s = spec.s0 + rng() * (spec.s1 - spec.s0); p[0] = a; p[1] = s; if (spec.mirror) p[2] = rng() < 0.5 ? 1 : 0; return p;
+}
+// Ferris-wheel exit (geometry only; slot weights stay CFG.WEXIT): the wisp hops out of its cabin through a door on the lower-left or lower-right
+// of the rim (50/50) with a uniform launch cone. Tuned in tune/wopt.js + wpolish.js so unsteered landings match CFG.WEXIT.
+const WEXIT_GEO = { phi: 141.536, gap: 1.067, a0: 83.84, a1: 162.95, s0: 40.54, s1: 80.99 }; // degrees (screen, y down) for the LEFT door; right door mirrored
+function exitSpec(t0) {
+  const D = Math.PI / 180, r = G.WR + G.R + WEXIT_GEO.gap;
+  return { kind: 'point', mirror: true, x: G.WX + Math.cos(WEXIT_GEO.phi * D) * r, y: G.WY + Math.sin(WEXIT_GEO.phi * D) * r, t0, a0: WEXIT_GEO.a0 * D, a1: WEXIT_GEO.a1 * D, s0: WEXIT_GEO.s0, s1: WEXIT_GEO.s1 };
 }
 
 // ---- bias tables for 'top' starts: start conditions that naturally reach each slot / the gate ----
@@ -1092,7 +1108,7 @@ function search(rng, spec, t0, target, env, budget, launch, railFn) {
   return { method: 'fail', n, rec: lastRec, out: lastO };
 }
 
-const API = { TOP, G, randTop, randX0, nails, present, sim, search, buildTable, Rec, slotOf, slotCenter, correct, rowX, get TABLE() { return TABLE; }, set TABLE(t) { TABLE = t; } };
+const API = { TOP, G, WEXIT_GEO, exitSpec, randPoint, startState, randTop, randX0, nails, present, sim, search, buildTable, Rec, slotOf, slotCenter, correct, rowX, get TABLE() { return TABLE; }, set TABLE(t) { TABLE = t; } };
 if (typeof module !== 'undefined' && module.exports) module.exports = API; else root.MFPhys = API;
 })(typeof self !== 'undefined' ? self : this);
 
@@ -1102,7 +1118,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = API; else 
 const P = (typeof module !== 'undefined' && module.exports) ? require('./phys.js') : root.MFPhys;
 const G = P.G;
 const RIDE = 2.6;              // seconds a wisp spends in the wheel (settle + half-turn + reveal)
-const EXIT = { x: G.WX, y: G.WY + G.WR + 7 };
+const EXIT = P.exitSpec(0); // left cabin door; the right door is its mirror (spec.mirror)
 function railTime(x0) { return 0.38 + (G.FW - x0) / 700; } // up the right rail + along the top rail to x0
 
 // candidate pumpkin positions: lattice nails in rows 1..8 away from the wheel and walls
@@ -1214,7 +1230,7 @@ function tryPlan(spec, rng) {
     const r = flySeg(rng, gateSeg, { gate: true }, env, 900); note(r);
     if (r.out.code !== -3) return null;
     const f = mkFlight(gateSeg, r, gateEntry, 'gate'); f.ride = { tc: r.out.t, te: r.out.t + RIDE, level: spec.wisps[gateEntry].gate }; flights.push(f);
-    const ex = { kind: 'point', x: EXIT.x, y: EXIT.y, t0: r.out.t + RIDE, a0: Math.PI * 0.06, a1: Math.PI * 0.94, s0: 20, s1: 260 };
+    const ex = P.exitSpec(r.out.t + RIDE);
     const r2 = flySeg(rng, ex, { slot: spec.wisps[gateEntry].slot }, env, 900); note(r2);
     flights.push(mkFlight(ex, r2, gateEntry, 'exit'));
   }
@@ -1230,7 +1246,7 @@ function flySeg(rng, seg, target, env, budget) {
     const r = P.search(rng, { kind: 'top' }, 0, target, env, budget, seg.launch, railTime);
     return r;
   }
-  return P.search(rng, { kind: 'point', x: seg.x, y: seg.y, a0: seg.a0, a1: seg.a1, s0: seg.s0, s1: seg.s1 }, seg.t0, target, env, budget);
+  return P.search(rng, { kind: 'point', x: seg.x, y: seg.y, a0: seg.a0, a1: seg.a1, s0: seg.s0, s1: seg.s1, mirror: seg.mirror }, seg.t0, target, env, budget);
 }
 function mkFlight(seg, r, entry, kind) {
   const pts = r.rec.pts; const f = { entry, kind, method: r.method, t0: pts[0], t1: pts[pts.length - 3], pts: Float32Array.from(pts), imps: Float32Array.from(r.rec.imps), init: !!seg.init, idx: seg.idx };
@@ -1553,8 +1569,11 @@ function startPack(p, spec, ctx2) {
     const tc = gf.ride.tc, te = gf.ride.te, lv = gf.ride.level; let best = 0, bestD = 1e9;
     for (let c = 0; c < 8; c++) { if (C.CABINS[c] !== lv) continue; const nat = wheel.base + wheel.omega * tc; let d = (-Math.PI / 2 - c * Math.PI / 4 - nat) % (2 * Math.PI); if (d < 0) d += 2 * Math.PI; if (d < bestD) { bestD = d; best = c; } }
     wheel.segs.push({ t0: Math.min(0.3, tc * 0.2), t1: Math.max(0.5, tc - 0.15), d: bestD });
-    wheel.segs.push({ t0: tc + 0.3, t1: tc + 2.0, d: Math.PI - wheel.omega * (te - tc) });
-    wheel.ride = { f: gf, tc, te, lv, cabin: best, revealed: false };
+    // carry the cabin from the gate (top) round to the door the wisp hops out of (lower-left or lower-right of the rim)
+    const ef = p.flights.find(f => f.kind === 'exit' && f.entry === gf.entry); const ex = ef ? ef.pts[1] : G.WX, ey = ef ? ef.pts[2] : G.WY + G.WR;
+    let rot = Math.atan2(ey - 10 - G.WY, ex - G.WX) + Math.PI / 2; rot = ((rot % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+    wheel.segs.push({ t0: tc + 0.3, t1: tc + 2.0, d: rot - wheel.omega * (te - tc) });
+    wheel.ride = { f: gf, tc, te, lv, cabin: best, revealed: false, ex, ey };
   }
   pack.queue = launchQueue(p);
   if (ctx2.kind === 'bonus' && game && game.decided && game.decided.packs && !game.pure) { const d = game.decided.packs; const pk = ctx2.golden ? d.find(q => q.full) : d[ctx2.k];
@@ -1900,6 +1919,7 @@ function drawWisps(time) {
     const ride = wheel.ride;
     if (f.kind === 'gate' && ride && ride.f === f && t >= f.t1 && t < ride.te) { // riding the wheel
       const u = Math.min(1, (t - f.t1) / 0.3); const cp = cabinPos(ride.cabin); const gx = G.WX, gy = G.GATE_Y; pos = [gx + (cp[0] - gx) * u, gy + (cp[1] - gy) * u];
+      const h = (t - (ride.te - 0.2)) / 0.2; if (h > 0) pos = [cp[0] + (ride.ex - cp[0]) * h, cp[1] + (ride.ey - cp[1]) * h]; // hop out through the cabin door
     } else if (t <= f.t1 + 0.001) pos = wispPos(f, t);
     else if (f.kind === 'slot' || f.kind === 'exit') { const dt2 = t - f.t1; if (dt2 < 0.3) { const e = posAt(f, f.t1); ctx.globalAlpha = 1 - dt2 / 0.3; const r = Math.max(1, Math.round(9 * (1 - dt2 / 0.3))); blitFC(GL(golden ? 'wispGold' : 'wisp', r * 2, r * 2), e[0], e[1] + dt2 * 40); ctx.globalAlpha = 1; } continue; }
     if (!pos) continue;
